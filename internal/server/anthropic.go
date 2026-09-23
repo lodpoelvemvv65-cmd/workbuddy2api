@@ -401,7 +401,7 @@ func anthropicMessageToOpenAI(m anthroMessage) []any {
 			outs = append(outs, map[string]any{
 				"role":         "tool",
 				"tool_call_id": b.ToolUseID,
-				"content":      anthropicToolResultText(b.Content),
+				"content":      anthropicToolResultContent(b.Content),
 			})
 		case "thinking", "redacted_thinking":
 			// 丢弃：见函数注释。
@@ -447,8 +447,15 @@ func anthropicImageURL(src *anthroSource) string {
 	return ""
 }
 
-// anthropicToolResultText 取 tool_result 的文本（字符串或块数组，图片块丢弃）。
-func anthropicToolResultText(raw json.RawMessage) string {
+// anthropicToolResultContent 取 tool_result 的内容，保留文本与图片块（方案 D）。
+//
+// 为什么不能丢图：pi 的 read 工具把图片作为 tool_result 的 image 块返回，旧实现
+// anthropicToolResultText 只取 text 块、把图静默丢掉，模型因此「看不见」read 到的
+// 图片。上游实测接受 tool 消息 content 为多模态 parts 数组（含 image_url），且能识图。
+//
+//   - 纯文本（字符串 / 全 text 块）→ 字符串（与旧实现逐字一致，存量请求零漂移）；
+//   - 含 image 块 → OpenAI 多模态 parts（text / image_url 保序），与顶层 user 图同构。
+func anthropicToolResultContent(raw json.RawMessage) any {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -457,16 +464,35 @@ func anthropicToolResultText(raw json.RawMessage) string {
 		return s
 	}
 	var blocks []anthroBlock
-	if json.Unmarshal(raw, &blocks) == nil {
-		var sb strings.Builder
-		for _, b := range blocks {
-			if b.Type == "text" {
-				sb.WriteString(b.Text)
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	var sb strings.Builder
+	parts := []any{}
+	hasImage := false
+	for _, b := range blocks {
+		switch b.Type {
+		case "text":
+			sb.WriteString(b.Text)
+			if b.Text != "" {
+				parts = append(parts, map[string]any{"type": "text", "text": b.Text})
+			}
+		case "image":
+			if u := anthropicImageURL(b.Source); u != "" {
+				parts = append(parts, map[string]any{
+					"type":      "image_url",
+					"image_url": map[string]any{"url": u},
+				})
+				hasImage = true
 			}
 		}
+	}
+	if !hasImage {
+		// 无图：返回字符串（与旧 anthropicToolResultText 结果逐字一致）。
 		return sb.String()
 	}
-	return ""
+	// 含图：必须 parts 数组（字符串装不下 image_url）。
+	return parts
 }
 
 // anthropicToolChoice 映射 tool_choice：auto→"auto"、any→"required"、

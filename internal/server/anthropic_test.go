@@ -543,3 +543,52 @@ func TestAnthropicNonStreamNormalUnchanged(t *testing.T) {
 		t.Errorf("内部截断标记不得出现在响应里:\n%s", body)
 	}
 }
+
+// TestAnthropicToolResultImagePreserved tool_result 内的 image 块必须转成 chat 多模态
+// parts（方案 D）——旧实现只取 text 块、把图静默丢掉，模型因此看不见 read 到的图片。
+func TestAnthropicToolResultImagePreserved(t *testing.T) {
+	in := []byte(`{"model":"m","max_tokens":100,"messages":[
+	  {"role":"user","content":"q"},
+	  {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"read","input":{}}]},
+	  {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[
+	     {"type":"text","text":"Read image file [image/png]"},
+	     {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAA"}}]}]}]}`)
+	out, _, err := anthropicToOpenAI(in, "m")
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := obj["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	toolMsg, _ := msgs[2].(map[string]any)
+	if toolMsg["role"] != "tool" {
+		t.Fatalf("tool msg = %v", toolMsg)
+	}
+	parts, ok := toolMsg["content"].([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("tool content 应为 2 个 part（text+image），got %v", toolMsg["content"])
+	}
+	if parts[0].(map[string]any)["type"] != "text" {
+		t.Errorf("part[0] = %v", parts[0])
+	}
+	img, _ := parts[1].(map[string]any)
+	iu, _ := img["image_url"].(map[string]any)
+	if img["type"] != "image_url" || !strings.HasPrefix(iu["url"].(string), "data:image/png;base64,") {
+		t.Errorf("part[1] image = %v", img)
+	}
+	// 纯文本 tool_result 仍须收敛成字符串（存量请求零漂移）。
+	in2 := []byte(`{"model":"m","messages":[{"role":"user","content":[
+	  {"type":"tool_result","tool_use_id":"t","content":[{"type":"text","text":"sunny"}]}]}]}`)
+	out2, _, _ := anthropicToOpenAI(in2, "m")
+	var obj2 map[string]any
+	_ = json.Unmarshal(out2, &obj2)
+	m0, _ := obj2["messages"].([]any)[0].(map[string]any)
+	if m0["content"] != "sunny" {
+		t.Errorf("纯文本 tool_result 应为字符串, got %v", m0["content"])
+	}
+}

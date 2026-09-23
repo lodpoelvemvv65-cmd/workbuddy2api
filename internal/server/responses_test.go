@@ -588,3 +588,52 @@ func TestResponsesNonStreamUpstreamInterrupted(t *testing.T) {
 		}
 	}
 }
+
+// TestResponsesImagePreserved 带图 content（user 消息 / function_call_output）必须
+// 转成 chat 多模态 parts——旧实现先取文本，导致 text+image 被静默降级成纯文本。
+func TestResponsesImagePreserved(t *testing.T) {
+	in := []byte(`{"model":"m","input":[
+	  {"type":"message","role":"user","content":[
+	     {"type":"input_text","text":"q"},
+	     {"type":"input_image","image_url":"data:image/png;base64,AAA"}]},
+	  {"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"c1","output":[
+	     {"type":"input_text","text":"read"},
+	     {"type":"input_image","image_url":"data:image/png;base64,BBB"}]}]}`)
+	out, _, err := responsesToOpenAI(in, "m")
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	msgs, _ := obj["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages = %v", msgs)
+	}
+	user, _ := msgs[0].(map[string]any)
+	uparts, ok := user["content"].([]any)
+	if !ok || len(uparts) != 2 {
+		t.Fatalf("user content 应为 parts，got %v", user["content"])
+	}
+	tool, _ := msgs[2].(map[string]any)
+	tparts, ok := tool["content"].([]any)
+	if !ok || len(tparts) != 2 {
+		t.Fatalf("tool content 应为 parts，got %v", tool["content"])
+	}
+	if tparts[1].(map[string]any)["type"] != "image_url" {
+		t.Errorf("tool part[1] = %v", tparts[1])
+	}
+	// 对象型 output 仍须原样 JSON 化（不因新分支而丢内容）。
+	in2 := []byte(`{"model":"m","input":[
+	  {"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},
+	  {"type":"function_call_output","call_id":"c1","output":{"text":"/tmp"}}]}`)
+	out2, _, _ := responsesToOpenAI(in2, "m")
+	var obj2 map[string]any
+	_ = json.Unmarshal(out2, &obj2)
+	m, _ := obj2["messages"].([]any)[1].(map[string]any)
+	if m["content"] != `{"text":"/tmp"}` {
+		t.Errorf("对象型 output 应 JSON 化, got %v", m["content"])
+	}
+}

@@ -270,20 +270,30 @@ func responsesRole(role string) string {
 }
 
 // responsesContent content 字段 → chat 的 content（字符串或 parts 数组）。
-// 纯文本收敛成字符串（省 token、避免上游对 parts 的兼容差异）；含图片才用数组。
+// 纯文本收敛成字符串（省 token、避免上游对 parts 的兼容差异）；**含图片必须数组**。
+//
+// 修复（与 anthropicToolResultContent 同源的丢图 bug）：旧实现先调 responsesText——
+// 它对「text+image」的数组只回文本，于是带图的 user 消息被静默降级成纯文本、图片丢失。
+// 这里改为先按 parts 解析、见到 input_image/image_url 才判定含图，文本与图片按原序保留。
 func responsesContent(raw json.RawMessage) any {
 	if len(raw) == 0 {
 		return nil
 	}
-	if s := responsesText(raw); s != "" {
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
 		return s
 	}
 	var parts []responsesPart
 	if json.Unmarshal(raw, &parts) != nil {
+		// {text:"..."} 单对象形态（非标准 content，兜底取文本）。
+		if t := responsesText(raw); t != "" {
+			return t
+		}
 		return nil
 	}
 	texts := []string{}
 	rich := []any{}
+	hasImage := false
 	for _, p := range parts {
 		switch p.Type {
 		case "input_image", "image_url":
@@ -295,20 +305,19 @@ func responsesContent(raw json.RawMessage) any {
 				img["detail"] = p.Detail
 			}
 			rich = append(rich, map[string]any{"type": "image_url", "image_url": img})
+			hasImage = true
 		default:
 			if p.Text != "" {
 				texts = append(texts, p.Text)
+				rich = append(rich, map[string]any{"type": "text", "text": p.Text})
 			}
 		}
 	}
-	if len(rich) == 0 {
+	if !hasImage {
 		if len(texts) == 0 {
 			return nil
 		}
 		return strings.Join(texts, "\n")
-	}
-	if len(texts) > 0 {
-		rich = append([]any{map[string]any{"type": "text", "text": strings.Join(texts, "\n")}}, rich...)
 	}
 	return rich
 }
@@ -343,14 +352,22 @@ func responsesText(raw json.RawMessage) string {
 	return ""
 }
 
-// responsesToolOutput function_call_output.output → 字符串（对象则原样 JSON 化）。
-func responsesToolOutput(raw json.RawMessage) string {
+// responsesToolOutput function_call_output.output → chat tool content。
+//   - 字符串 → 原样；
+//   - 块数组（input_text / input_image）→ 纯文本收敛成字符串、含图转 parts 数组
+//     （与 responsesContent / anthropicToolResultContent 同源，保留图片）；
+//   - 其余对象 → 原样 JSON 化（不丢内容）。
+func responsesToolOutput(raw json.RawMessage) any {
 	if len(raw) == 0 {
 		return ""
 	}
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
 		return s
+	}
+	var parts []responsesPart
+	if json.Unmarshal(raw, &parts) == nil {
+		return responsesContent(raw)
 	}
 	return strings.TrimSpace(string(raw))
 }
