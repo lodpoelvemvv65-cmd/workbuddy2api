@@ -40,8 +40,12 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		gotAnyContent bool
 		validEvents   int
 		sawDone       bool // 上游显式发过 data: [DONE]（正常收尾）
-		toolCalls     = map[int]map[string]any{}
-		toolOrder     []int
+		// sawFinish 上游是否**显式**给过 finish_reason。区别于 finishReason 的默认值
+		// "stop"：没有它就无法把「模型说完了」和「连接被掐断」分开（后者此前也被
+		// 折叠成 "stop"，兼容层于是把半截正文译成正常结束）。见 TruncatedKey。
+		sawFinish bool
+		toolCalls = map[int]map[string]any{}
+		toolOrder []int
 		// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
 		// 同帧内递增（见 mergeToolCallsChunk 注释）。
 		toolSeq int
@@ -176,6 +180,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 							}
 							if fr, ok := c["finish_reason"].(string); ok && fr != "" {
 								finishReason = fr
+								sawFinish = true
 							}
 							if delta, ok := c["delta"].(map[string]any); ok {
 								if r2, ok := delta["role"].(string); ok && r2 != "" {
@@ -256,6 +261,13 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 				"finish_reason": finishReason,
 			},
 		},
+	}
+	if !sawFinish {
+		// 上游 EOF 收尾却没给 finish_reason：内容大概率是半截的（连接被掐）。
+		// finish_reason 只能是默认 "stop"，与"真说完"不可区分，故另立标记键供兼容层
+		// 判别（见 TruncatedKey 注释）。原生 chat 路径会 TakeTruncated 取走该键，
+		// 对外响应与本改动前逐字节一致。
+		resp[TruncatedKey] = true
 	}
 	if usage != nil {
 		// OpenAI 非流式 usage 必含 total_tokens。上游若只发 prompt_tokens +

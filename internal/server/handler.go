@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -42,6 +43,12 @@ type Config struct {
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
 
+	// AnthropicDefaultModel /v1/messages 兼容层里 claude* 模型名的映射目标
+	// （config anthropic.default_model）。空 = 内置默认（见 anthropic.go
+	// defaultAnthropicModel）：Claude Code 默认发 claude-sonnet-*，上游没有这些
+	// 名字，必须落到一个真实存在的模型上。
+	AnthropicDefaultModel string
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -51,6 +58,27 @@ type Config struct {
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
+
+	// ModelAliases 模型别名表（config model_aliases）：把客户端惯用的短名换成真实
+	// 上游模型名，在 realm 解析与候选链之前生效，故 /v1/chat/completions 与
+	// /v1/messages 两条入口同待遇。键会被 canonicalModelName 归一化（大小写 / realm
+	// 前缀 / [1M] 标记 / -sg 后缀都不影响命中），值建议写真实模型名，可带 realm 前缀。
+	// 空 / nil = 不启用，行为零变化。
+	//
+	// 为什么要它：模型名写错的代价很高——上游回 11102 `service info not found`，
+	// 网关会把它记成该账号的模型级黑名单，后续重试直接变成 `no_healthy_account`，
+	// 看起来像账号全挂，实际只是名字写错。
+	ModelAliases map[string]string
+	// ColdCatalogWarm 允许在 chat 请求路径上**后台**触发一次模型目录预热：
+	// 候选链（modelchain.go）需要目录快照，若请求到来时快照还是冷的（容器刚起、
+	// 预热还没跑完，或上游目录拉取失败过），首个请求会退化成单候选透传、失去
+	// 「免费档用完换积分档」的兜底。开启后由请求悄悄补一次预热，下一个请求即恢复。
+	//
+	// 默认 false，生产由 main 打开。为什么不做成默认开：预热会真的发上游请求，
+	// 单元测试里的假上游按 chat 形态构造、不认 models 端点（有的还直接对 nil body
+	// 做 io.ReadAll），请求路径上凭空多一个后台 goroutine 会让测试变成随机失败。
+	// 真要不踩坑就得让测试逐个显式关闭，不如让生产显式打开。
+	ColdCatalogWarm bool
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -85,6 +113,10 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// warmBusy 冷快照后台预热的单飞标志（atomic）：同一时刻只允许一个预热在途，
+	// 避免目录长期拉不到时每个请求都起一个 goroutine 去撞上游（上游目录自身另有
+	// 5min 负缓存兜底，这里只挡并发风暴）。
+	warmBusy atomic.Bool
 }
 
 // NewHandler 构建 handler。
@@ -101,12 +133,37 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "passthrough" // 缺省 passthrough：透传客户端原始 system
 	}
+	if cfg.AnthropicDefaultModel == "" {
+		cfg.AnthropicDefaultModel = defaultAnthropicModel // Claude Code 默认模型的落点
+	}
+	// 别名表键归一化到 canonical 键（与候选链的同名家族判定同一口径）：
+	// 配置里怎么写都能命中，重复键以 canon 折叠后的最后一次为准。
+	if len(cfg.ModelAliases) > 0 {
+		norm := make(map[string]string, len(cfg.ModelAliases))
+		for k, v := range cfg.ModelAliases {
+			ck, target := canonicalModelName(k), strings.TrimSpace(v)
+			if ck == "" || target == "" {
+				continue
+			}
+			norm[ck] = target
+		}
+		cfg.ModelAliases = norm
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// Anthropic Messages 兼容层（Claude Code / 官方 Anthropic SDK 直连）。
+	// 见 anthropic.go 文件头：协议垫片复用 chatCompletions 的整条上游管线。
+	h.mux.HandleFunc("POST /v1/messages", h.withAuth(h.messages))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuth(h.messagesCountTokens))
+	// OpenAI Responses 兼容层（codex-cli wire_api="responses"）。见 responses.go 文件头。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /v1/stats", h.withAuth(h.stats))
 	h.mux.HandleFunc("POST /v1/stats/reset", h.withAuth(h.statsReset))
+	// 最近请求流水（最近 ~1000 条的内存环形缓冲），供独立面板轮询。
+	// 只读、只增端点；数据源与请求表格日志同一个出口（chatStat.done）。
+	h.mux.HandleFunc("GET /v1/logs", h.withAuth(h.logs))
 	// 运维管理端点（默认关闭，config admin.enabled 开启后生效）。
 	// 路径用 {uid} 通配而非查询参数：uid 是账号身份，放进路径便于审计与直观。
 	// 条件注册而非 handler 内 404（设计 supplement §2.3）：未注册的路由对未鉴权
@@ -133,9 +190,19 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			// 常量时间比较（发现 7）：!= 短路时序随前缀长度变化，公网暴露下
 			// 理论上可逐字节探测 key 前缀；ConstantTimeCompare 消除该信号。
 			provided := strings.TrimPrefix(authz, "Bearer ")
-			if !strings.HasPrefix(authz, "Bearer ") ||
-				subtle.ConstantTimeCompare([]byte(provided), []byte(h.cfg.APIKey)) != 1 {
-				writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			if !strings.HasPrefix(authz, "Bearer ") {
+				// Anthropic 系客户端（Claude Code / 官方 SDK）只用 x-api-key，不发
+				// Authorization；两种形态都接受，否则 /v1/messages 对它们恒 401。
+				provided = r.Header.Get("X-Api-Key")
+			}
+			if subtle.ConstantTimeCompare([]byte(provided), []byte(h.cfg.APIKey)) != 1 {
+				// 错误信封按协议分流：Anthropic 客户端解析 error.type，喂 OpenAI
+				// 形态的 body 它认不出（只会退化成"未知错误"）。
+				if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+					writeAnthropicError(w, http.StatusUnauthorized, "missing or invalid API key")
+				} else {
+					writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+				}
 				return
 			}
 		}
@@ -196,6 +263,10 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		// upstream_truncated 上游断流计数（messages / responses 两协议分桶）：
+		// 进程内累计、只增键。与流式 WARN 互补——它覆盖非流式路径，且不依赖
+		// 干净 EOF（TCP RST 也能计到）。
+		"upstream_truncated": upstreamTruncationSnapshot(),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -227,6 +298,55 @@ const (
 	dynamicModelsTTL        = time.Hour
 	modelsFetchFailCooldown = 5 * time.Minute
 )
+
+// dynamicModelsSnapshot 只读 CN 模型目录快照（TTL 内），冷 / 过期 → nil。
+// 与 fetchDynamicModels 的关键差异：**绝不发起上游调用**。chat 热路径（modelChain）
+// 只允许走本方法，额外上游往返换来的延迟与 WAF 记账放大不值得。
+func dynamicModelsSnapshot() []upstream.ModelInfo {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	if len(dynamicModelsCache.ids) == 0 || time.Since(dynamicModelsCache.fetched) >= dynamicModelsTTL {
+		return nil
+	}
+	return dynamicModelsCache.ids
+}
+
+// WarmModelCatalog 预热两张模型目录（CN 动态表 + global 探测表），供 modelChain
+// 在 chat 路径上只读快照。生产由 main 的后台循环周期调用；测试不调用（快照为空
+// → 候选链退化为单候选透传，测试行为不变，也不会产生意外上游请求）。
+//
+// 失败无所谓：两侧目录自带负缓存（CN 5min / global 5min），下一轮再试；
+// 无号 / 无 global 账号时直接空转返回。
+func (h *Handler) WarmModelCatalog() {
+	h.fetchDynamicModels()
+	if !h.cfg.GlobalEnabled {
+		return
+	}
+	if ids, acct := h.fetchGlobalModels(); len(ids) > 0 && acct != nil {
+		h.cfg.Upstream.FetchGlobalModelInfos(acct)
+	}
+}
+
+// triggerCatalogWarm 冷快照补预热：由 chat 请求路径在发现目录快照为空时调用。
+//
+// 语义是「尽力而为」：本次请求**不等**结果（继续按冷快照走单候选透传），预热在后台
+// 跑完，下一个请求就拿到完整候选链。单飞标志挡住并发风暴；失败不重试、不记录错误
+// ——目录自身的负缓存（CN 5min / global 5min）负责节流，这里只补一次。
+func (h *Handler) triggerCatalogWarm() {
+	if !h.cfg.ColdCatalogWarm || !h.warmBusy.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer h.warmBusy.Store(false)
+		h.WarmModelCatalog()
+	}()
+}
+
+// catalogCold 报告 CN 模型目录快照是否处于「冷」（空或过期）。
+// 与 dynamicModelsSnapshot 同判据，供候选链决定要不要补预热。
+func catalogCold() bool {
+	return len(dynamicModelsSnapshot()) == 0
+}
 
 // models 返回模型列表：纯动态（缓存 1h），失败/无号返回空列表（无静态兜底）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
@@ -494,6 +614,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
+	// 模型别名（config model_aliases）先于一切解析生效：把客户端惯用短名换成真实
+	// 上游模型名，后面的 realm 解析 / 候选链 / 账本全部按真实名走。未命中 → 原样。
+	aliased := false
+	peek.Model, aliased = h.aliasModel(peek.Model)
+	// 命中别名必须把**出站 body** 的 model 一并换掉：下面的 bareModel 改写只在
+	// bareModel != peek.Model 时触发（改的是 realm 前缀/上下文标记），而别名替换后两者
+	// 恰好相等，于是 body 里会残留客户端原始短名直传上游——上游对未知模型名回 11102，
+	// 还会把该名字记进账号级模型黑名单（实测：deepseek-flash 直传 → 两号全 400）。
+	if aliased {
+		body = rewriteModel(body, peek.Model)
+	}
+
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/账本/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
@@ -501,10 +633,46 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	if aliased {
+		// 别名命中：流水/指标记实际用的模型名，否则日志里只有一个对不上的短名。
+		st.model = peek.Model
+	}
 	defer st.done()
 
 	tried := map[string]bool{}
 	var lastErr error
+
+	// 候选链：客户端只写模型名，网关按「同名家族」展开成「免费优先 → 积分档」的候选
+	// 链（跨域、含 -sg 区域变体、按 [1M] 标记过滤上下文档位）。见 modelchain.go。
+	//
+	// 链首即默认出站模型，与引入本链之前的行为一致；只有当当前候选在整个池里都没有
+	// 可用账号时（典型形态：免费档额度用尽 → 该模型在全部账号上被 6004 模型级冷却）
+	// 才沿链推进到下一个候选——这就是「先免费用，用完自动换积分档」。
+	// 目录未收录该模型时链只有一项（原样透传），行为零变化。
+	chain := h.modelChain(peek.Model, realm, bareModel)
+	chainIdx := 0
+	if len(chain) > 0 {
+		realm, bareModel = chain[0].Realm, chain[0].ID
+	}
+	// advanceChain 换到下一个候选；已到链尾返回 false（调用方回落 503）。
+	// 换候选**不消耗轮转名额**（调用方 i--），否则 MaxRotate=3 会被候选数吃掉，
+	// 单候选就再也轮不动号了。
+	advanceChain := func() bool {
+		if chainIdx+1 >= len(chain) {
+			return false
+		}
+		chainIdx++
+		realm, bareModel = chain[chainIdx].Realm, chain[chainIdx].ID
+		// 新候选必须能重用旧候选试过的账号：否则"被免费档用过的号"在积分档上会被跳过。
+		tried = map[string]bool{}
+		body = rewriteModel(body, bareModel)
+		// 流水/指标记实际出站模型——否则"免费档自动切到积分档"在日志里看不出来。
+		st.model = bareModel
+		// 降级事件单独留一行：这是「免费用完自动换积分档」的唯一可观测点
+		// （候选链的取舍全在这个转换里发生，出问题时没有第二处日志能定位）。
+		log.Printf("INFO: [server] 候选链降级 -> realm=%s model=%s（前序候选无可用账号）", realm, bareModel)
+		return true
+	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
@@ -652,6 +820,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
 		if acct == nil {
+			// 本候选在当前池里已经没有可用账号（含模型级 6004 豁免口径下的全池耗尽）：
+			// 沿候选链推进到下一个（免费用完 → 换积分档）。链尾仍无号才回 503。
+			if advanceChain() {
+				i-- // 换候选不占轮转名额
+				continue
+			}
 			st.status = http.StatusServiceUnavailable
 			break
 		}
@@ -854,6 +1028,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			toks, hasUsage := stats.Tokens()
 			if hasUsage {
 				st.toks = toks
+			} else {
+				// 流有内容帧却缺末帧 usage：上游大概率在收尾前被掐断（正常流末帧必带
+				// usage，见 upstream 收尾段）。在此之前该形态零痕迹——日志只显示
+				// tok=-，与"usage 未观测"混为一谈，断流时无从取证。
+				log.Printf("WARN: [server] stream ended without usage acct=%s model=%s (possible upstream truncation)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel)
+			}
+			// 上游断流的**直接证据**：读到 EOF 却从未见 [DONE]（实测正常流必然两者齐备）。
+			// 必须在这里判定——透传层（upstream.StreamHint）收尾时无条件补发 [DONE]
+			// 且恒返回 nil，断流事实到不了这一层，只能靠自己读到的原始信号。
+			// 与上面的 usage 告警互补：这个是确证（连接确实提前结束），那个是间接推断。
+			if stats.SawEOF() && !stats.SawDone() {
+				log.Printf("WARN: [server] upstream truncated acct=%s model=%s: EOF before [DONE] (client saw a synthesized terminator)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
 			// metrics 采集：token 三段 + 缓存三段 + 真实扣费（供 /v1/stats）。
 			// 与成本账本同源同口径（都读末帧 usage），故此处一并带出，避免二次解析。
@@ -883,6 +1071,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
+		}
+		// 上游断流标记（Aggregate 在无 finish_reason 时置位）是网关内部约定，绝不能
+		// 出现在对外响应里。原生 chat 路径没有表达「未写完」的字段（OpenAI 无此语义），
+		// 只能取走标记后按原样透出——半截内容对原生客户端本就不可区分，这是既有行为。
+		// 兼容层（/v1/messages、/v1/responses）有 incomplete/error 语义，需要读到这个
+		// 事实自己收尾，故由它们（truncationAware）自行取走，此处不得抢先消费。
+		if _, aware := w.(truncationAware); !aware {
+			_ = upstream.TakeTruncated(resp)
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
@@ -1114,6 +1310,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// truncationAware 由协议兼容层（/v1/messages、/v1/responses）的转换型 ResponseWriter
+// 实现：它们在聚合响应里读上游断流标记（upstream.TruncatedKey）并译成本协议的
+// 语义（Anthropic 的 error 事件 / Responses 的 incomplete），因此 chatCompletions
+// 的原生收尾不得抢先把它取走（见 handler 非流式分支）。
+type truncationAware interface {
+	consumesUpstreamTruncation()
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)

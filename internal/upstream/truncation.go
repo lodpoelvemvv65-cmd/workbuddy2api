@@ -45,3 +45,29 @@ func dropTruncatedToolCalls(calls []map[string]any) []map[string]any {
 	}
 	return kept
 }
+
+// TruncatedKey 聚合响应里的截断标记键（网关内部约定，非 OpenAI 字段）。
+//
+// 背景：Aggregate 无法用 finish_reason 表达「流被掐断」——它的默认值就是 "stop"，
+// 与「模型真说完」不可区分（OpenAI 协议本身也没有 incomplete 语义）。但兼容层
+// （/v1/messages、/v1/responses）必须能区分，否则上游中途断流会被它们译成
+// end_turn / completed，客户端把半截正文当最终答案。
+//
+// 故 Aggregate 在「上游 EOF 收尾但没给 finish_reason」时置此键为 true，由消费者
+// **读取并删除**（见 TakeTruncated）——原生 /v1/chat/completions 路径删掉后逐字节
+// 不变，兼容层删掉前先取走这个事实。
+const TruncatedKey = "wb2api_stream_truncated"
+
+// TakeTruncated 读取并移除截断标记（幂等：无标记返回 false）。
+//
+// 刻意用「取走」而非「只读」：标记绝不能出现在任何对外响应里（原生 OpenAI 客户端
+// 看到未知顶层键属于协议污染）。一处取走即可保证干净透出。
+func TakeTruncated(resp map[string]any) bool {
+	v, ok := resp[TruncatedKey]
+	if !ok {
+		return false
+	}
+	delete(resp, TruncatedKey)
+	b, _ := v.(bool)
+	return b
+}

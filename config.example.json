@@ -3,6 +3,8 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "log_file": "",
+  "log_max_mb": 64,
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"

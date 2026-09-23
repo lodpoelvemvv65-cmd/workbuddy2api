@@ -19,6 +19,13 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+	// LogFile 日志落盘路径（stderr 之外再镜像一份到该文件，便于容器重建后回查
+	// 断流/告警）。空 = 关闭（默认，仅 stderr，即 docker logs）。打开失败不致命——
+	// 打一条 WARN 后降级为仅 stderr，绝不因日志权限问题拒绝启动。
+	LogFile string `json:"log_file"`
+	// LogMaxMB 日志文件轮转阈值（MB），超过即切一份 .1 备份（只留最近一份）。
+	// <=0 回落默认 64。仅在 log_file 非空时生效。
+	LogMaxMB int `json:"log_max_mb"`
 
 	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
 
@@ -111,23 +118,46 @@ type Config struct {
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
 
+	// Anthropic Anthropic Messages 兼容层（POST /v1/messages）配置。
+	// 该层让 Claude Code / 官方 Anthropic SDK 直连本网关（见 internal/server/anthropic.go）。
+	Anthropic struct {
+		// DefaultModel claude* 模型名的映射目标：Claude Code 默认发 claude-sonnet-*
+		// 之类，上游没有这些名字，直传必失败。空 = 内置默认（internal/server 的
+		// defaultAnthropicModel，当前 deepseek-v4.1-flash：CN 1M 上下文）。
+		// 允许带 realm 前缀（如 "global:gpt-5.6-luna"），按 resolveModel 规则解析。
+		DefaultModel string `json:"default_model"`
+	} `json:"anthropic"`
+
+	// ModelAliases 模型别名表：客户端惯用短名 → 真实上游模型名，/v1/chat/completions
+	// 与 /v1/messages 两条入口都生效（在 realm 解析与候选链之前生效）。
+	//
+	//	"model_aliases": {"deepseek-flash": "deepseek-v4.1-flash"}
+	//
+	// 键按「同名家族」归一化匹配（大小写 / realm 前缀 / [1M] 标记 / -sg 后缀都不影响
+	// 命中），值建议写真实模型名、可带 realm 前缀（"global:xxx" 时以值自身的域为准）。
+	//
+	// 为什么值得配：模型名写错的代价很高——上游回 11102 `service info not found`，
+	// 网关会把它记成该账号的模型级黑名单（数小时），后续重试直接退化成
+	// `no_healthy_account`，看起来像账号全挂，实际只是名字写错。
+	ModelAliases map[string]string `json:"model_aliases"`
+
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
 
 	Pool struct {
-		MaxInFlight        int     `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int     `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
-		BreakerThreshold   int     `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
-		BreakerCooldown    string  `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
-		BreakerCooldownMax string  `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 403 风控分档），0 = 回落 max_in_flight
+		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
+		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
+		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
 		// 连败降权（issue #114「累计错误率高/连续失败 N 次的账号移出候选池一段时间」）：
 		// ErrClient/传输层这类「不罚号」失败连续计数，达阈临时出池。与冷却/熔断
 		// 并存取更长者不叠加。默认 5 次 / 10m。
-		DegradeThreshold   int    `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
-		DegradeCooldown    string `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
-		DegradeCooldownMax string `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
+		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
+		DegradeCooldown    string  `json:"degrade_cooldown"`     // 降权时长（固定，非指数退避），默认 "10m"
+		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
@@ -168,6 +198,8 @@ func Default() *Config {
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
+		// LogFile 缺省空 = 不落盘（零回归：默认行为仍是纯 stderr / docker logs）。
+		LogMaxMB: 64,
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
@@ -242,6 +274,14 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
 	}
+	if v := os.Getenv("WB2A_LOG_FILE"); v != "" {
+		c.LogFile = v
+	}
+	if v := os.Getenv("WB2A_LOG_MAX_MB"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.LogMaxMB = n
+		}
+	}
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
 		c.Cooldown.SoftRate = v
 	}
@@ -297,6 +337,9 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
 		c.Prompt.File = v
 	}
+	if v := os.Getenv("WB2A_ANTHROPIC_MODEL"); v != "" {
+		c.Anthropic.DefaultModel = v
+	}
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
@@ -336,6 +379,10 @@ func (c *Config) normalize() error {
 	}
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	// log_max_mb 归一：<=0 回落默认 64（仅在 log_file 非空时被使用）。
+	if c.LogMaxMB <= 0 {
+		c.LogMaxMB = 64
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3

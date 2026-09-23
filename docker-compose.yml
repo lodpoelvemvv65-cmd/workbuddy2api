@@ -22,3 +22,33 @@ services:
       #   chown -R 10001:10001 ./data
       - ./data:/app/data
       - ./config.json:/app/config.json:ro
+      # logs 日志卷：app(uid 10001) 需写权限。若容器内报 permission denied，宿主机执行：
+      #   mkdir -p ./logs && chown -R 10001:10001 ./logs
+      # 配合 config.json 的 "log_file": "./logs/wb2api.log"（阈值 log_max_mb，默认 64MB，轮转留 .1）。
+      - ./logs:/app/logs
+
+  # 独立可视化面板（缓存命中率 / 速度 / 最近日志 / 账号池）：只读网关数据端点，
+  # 自身不碰上游、不写共享状态，与网关核心解耦（见 README「可视化面板」）。
+  #   - 网关地址用 compose 服务名 wb2api（容器内 127.0.0.1 指向面板自身，不能用于访问网关）；
+  #   - api_key 从只读挂载的 config.json 读取；
+  #   - 需重建镜像后生效：docker compose up -d --build dashboard
+  dashboard:
+    build: .
+    container_name: workbuddy2api-dashboard
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "7864:7864"
+    volumes:
+      - ./config.json:/app/config.json:ro
+    entrypoint: ["/app/dashboard", "-listen", ":7864", "-gateway", "http://wb2api:7863"]
+    # 覆盖镜像里指向网关 :7863 的 HEALTHCHECK——面板监听 :7864，沿用会让容器恒被判 unhealthy。
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:7864/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+    depends_on:
+      - wb2api

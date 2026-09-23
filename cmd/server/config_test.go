@@ -749,3 +749,55 @@ func TestPromptInvalidModeStillErrors(t *testing.T) {
 		t.Errorf("error should mention (custom / append / passthrough): %v", err)
 	}
 }
+
+// TestLoadModelAliases config model_aliases 解析：JSON 键名与映射值原样进来
+// （别名表内容不做校验，非法项在 server.NewHandler 归一化时逐条丢弃）。
+func TestLoadModelAliases(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"listen":":1","api_key":"k",`+
+		`"model_aliases":{"deepseek-flash":"deepseek-v4.1-flash"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ModelAliases["deepseek-flash"]; got != "deepseek-v4.1-flash" {
+		t.Errorf("model_aliases = %v", c.ModelAliases)
+	}
+}
+
+// TestLogFileParsedAndEnv log_file / log_max_mb 解析与 env 覆盖：缺省关闭（空路径），
+// env 可开启并覆盖阈值；log_max_mb<=0 归一回落默认 64。
+func TestLogFileParsedAndEnv(t *testing.T) {
+	c := Default()
+	if c.LogFile != "" {
+		t.Errorf("缺省 log_file 应为空，got %q", c.LogFile)
+	}
+	if c.LogMaxMB != 64 {
+		t.Errorf("缺省 log_max_mb 应为 64，got %d", c.LogMaxMB)
+	}
+
+	t.Setenv("WB2A_LOG_FILE", "/tmp/x.log")
+	t.Setenv("WB2A_LOG_MAX_MB", "8")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LogFile != "/tmp/x.log" || c.LogMaxMB != 8 {
+		t.Errorf("env 覆盖失败: %+v", c)
+	}
+
+	// 非法/非正阈值归一回落默认 64。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"log_file":"./logs/a.log","log_max_mb":0}`), 0o600)
+	t.Setenv("WB2A_LOG_FILE", "") // 清掉上一段 env 覆盖，回到文件值
+	t.Setenv("WB2A_LOG_MAX_MB", "")
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.LogFile != "./logs/a.log" || c2.LogMaxMB != 64 {
+		t.Errorf("归一失败: %+v", c2)
+	}
+}

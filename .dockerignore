@@ -1,5 +1,6 @@
 auths/
 data/
+logs/
 *.tmp
 .git/
 .gitignore

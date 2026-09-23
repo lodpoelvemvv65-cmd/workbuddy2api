@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +17,33 @@ import (
 
 // chatSeq 进程级请求序号。
 var chatSeq atomic.Int64
+
+// statsOut 请求流水（表格行）输出目标；nil = 回落到**当前** os.Stdout（docker logs
+// 口径不变，且测试的 captureStdout 换 os.Stdout 仍生效）。main 开启 log_file 时经
+// SetStatsOutput 接到 io.MultiWriter(os.Stdout, 日志文件)，使流水行与 log 告警
+// （断流 WARN 等）落在同一份可跨越容器重建回查的文件里。
+var (
+	statsOutMu sync.RWMutex
+	statsOut   io.Writer
+)
+
+// SetStatsOutput 替换请求流水输出目标（nil 回落当前 os.Stdout）。仅启动期 / 测试调用。
+func SetStatsOutput(w io.Writer) {
+	statsOutMu.Lock()
+	statsOut = w
+	statsOutMu.Unlock()
+}
+
+// statsWriter 读当前请求流水输出目标；未显式设置时动态取 os.Stdout。
+func statsWriter() io.Writer {
+	statsOutMu.RLock()
+	w := statsOut
+	statsOutMu.RUnlock()
+	if w != nil {
+		return w
+	}
+	return os.Stdout
+}
 
 // chatLogEnabled 聊天表格日志总开关。生产恒 true；
 // 测试包经 TestMain 置 false 关闭 stdout 噪音，需要断言行输出的测试用 withChatLog 临时开启（R5）。
@@ -64,8 +92,11 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	total := time.Since(s.start)
-	logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	seq := logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
 	recordChatMetric(s, total)
+	// 最近流水环形缓冲（/v1/logs 数据源）。与表格日志同点写入，seq 共用——
+	// 页面上的 #序号与日志文件逐条对齐，排障时可互相指认。
+	appendRequestLog(s, total, seq)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -85,12 +116,28 @@ type chatStatsReader struct {
 	cacheMiss int     // 末帧 usage.prompt_cache_miss_tokens
 	cacheWr   int     // 末帧 usage.prompt_cache_write_tokens
 	pend      []byte  // 已读未返回的行缓存
+
+	// sawDone 上游显式发过 data: [DONE]（正常收尾）。
+	sawDone bool
+	// sawEOF 上游 body 已被读到 EOF。
+	// 与 sawDone 组合出「上游断流」的**直接证据**：读到 EOF 却从未见 [DONE]。
+	// 之所以必须在此单独观测：upstream.StreamHint 会在收尾时无条件补发一个
+	// [DONE]（保证客户端能正常收尾），且它恒返回 nil（见 TestStreamDoneFallback）
+	// ——断流事实在透传层被有意吞掉，不记这行就只能靠"usage 缺失"间接猜测，
+	// 与"上游本就不给 usage"混为一谈，出问题时无从取证。
+	sawEOF bool
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
 	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
 }
+
+// SawDone 上游是否显式发过 data: [DONE]（正常收尾标记）。
+func (s *chatStatsReader) SawDone() bool { return s.sawDone }
+
+// SawEOF 上游 body 是否读到 EOF（false = 读取被提前中断，如客户端断连）。
+func (s *chatStatsReader) SawEOF() bool { return s.sawEOF }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。
 func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
@@ -122,6 +169,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
+		s.sawDone = true
 		return
 	}
 	if !s.seen {
@@ -164,10 +212,16 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 	line, err := s.br.ReadString('\n')
 	if line != "" {
 		s.parseSSELine(line)
+		if err == io.EOF {
+			s.sawEOF = true
+		}
 		s.pend = []byte(line)
 		n := copy(p, s.pend)
 		s.pend = s.pend[n:]
 		return n, nil
+	}
+	if err == io.EOF {
+		s.sawEOF = true
 	}
 	return 0, err
 }
@@ -234,16 +288,17 @@ const (
 	chatRateWidth = 11 // 形如 "183.6tok/s"
 )
 
-// logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
+// logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀），
+// 并返回该行的进程级序号（供最近流水缓冲对齐；chatLogEnabled=false 时返回 0）。
 //
 // 参数：
 //   - model：模型名（含 realm 前缀），超 chatModelWidth 截断（模型名是 ASCII，字节截即列宽）；
 //   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
+func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) int64 {
 	if !chatLogEnabled {
-		return
+		return 0
 	}
 	seq := chatSeq.Add(1)
 	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
@@ -263,7 +318,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |\n",
+	fmt.Fprintf(statsWriter(), "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -275,4 +330,5 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status
 		logfmt.Pad(tokpsField, chatRateWidth),
 		total.Seconds(),
 	)
+	return seq
 }

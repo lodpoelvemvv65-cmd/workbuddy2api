@@ -34,7 +34,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 
 ### 本项目不做什么
 
-- **只做上游网关，不做下游协议转换** — 本项目仅负责对接上游 ```CodeBuddy``` 并暴露 OpenAI Chat 协议；Anthropic Messages、Gemini 等其他协议的适配应由下游网关负责；
+- **只做上游网关，不做通用协议转换层** — 核心是对接上游 ```CodeBuddy``` 并暴露 OpenAI Chat 协议；另附两个**面向自家下游客户端**的协议垫片（`/v1/messages` 给 Claude Code、`/v1/responses` 给 Codex CLI），它们复用同一条上游管线、只做形状翻译。其余协议（Gemini 等）的适配仍应由下游网关负责；
 - **不内嵌 Web 管理面板** — 网关核心保持精简，可视化面板作为独立项目维护，数据直取上游接口，不增加网关适配负担。
 
 ### 社区前端面板
@@ -58,6 +58,9 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 - **在途租约** — 单账号最大在途请求数（`pool.max_in_flight`）限制并发占用，占满的号不参与选号，避免单号过载
 - **账本择优** — 每次成功请求按 `usage.credit` 折算每千 token 单价记入 `(账号, 模型)` 账本，免费 / 便宜的账号优先；观测按 EMA 平滑、6 小时未更新即失效（陈旧价格不复活），成本随上游活动实时变化；账本随池状态落盘 `state.json`，重启不丢学费；`/status` 透出 `model_costs` 台账（模型 / 单价 / 末次观测 / 样本数）
 - **成本分层条件探索** — costTier 硬过滤（免费 > 未知 > 收费）会把全池锁死在唯一的实测免费号上：其余账号永远轮不到、也就永远学不到「它其实也免费」（垄断 + 学习冻结，issue #136）。破解方式是**搭车改道**：tier 0 垄断层存在且 tier 1 有成员时，距上次探索 ≥ `pool.cost_explore_interval`（默认 30m，`"0"` 关停）就把本次选号改道给一个未知号——承接的是完整真实用户请求，**零新增上游请求**（IP 维度零增量，WAF 友好）。成功即毕业（首观测入账，免费回 tier 0 / 收费出局 tier 2，学费只付一次）；失败走既有冷却 / 熔断策略，无探测风暴。探索频率硬性限幅 ≤ 48 次 / 天 / 模型（24h ÷ 30m），与池规模和 QPS 无关；tier 1 枯竭后自动停探。探索节奏按 `(域, 模型)` 独立；`/status` 透出 `cost_explore` 台账（累计事件数 + 各 (域, 模型) 最近探索时刻），与 `model_costs` 行对照即可读出「探索 → 毕业」全链路
+
+- **模型别名表** — `config model_aliases` 把客户端惯用短名映射到真实上游模型名，`/v1/chat/completions`、`/v1/messages`、`/v1/responses` 三条入口同待遇；键按同名家族归一化匹配（大小写 / `cn:` `global:` 前缀 / `[1M]` 标记 / `-sg` 后缀都不影响命中），换名保留客户端写的前缀与标记。模型名写错会触发上游 11102 并被记成账号的模型级黑名单，后续重试退化成 `no_healthy_account`（看着像账号全挂），别名表是这一坑的解药
+- **同名家族候选链（免费优先 → 积分兜底）** — 客户端只写模型名，网关把同族候选（跨域 / 区域变体 `-sg` / 计费档）展开成链并按「`x0.00` 免费档 → 倍率升序」排序，**只在当前候选全池无可用号时**沿链推进：免费额度在就白嫖、用完自动换积分档，国内国外同一套规则；`[1M]` 只做档位过滤（没有 1M 版本就退回原模型），目录未收录的模型名原样透传。日志 / 指标记实际出站模型，降级链路可见。见「Anthropic Messages 兼容接口」一节
 
 ### 流量治理
 
@@ -109,6 +112,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 - 手动签到：`./signin.sh`（批量、幂等不重复计）
 - 账号停用 / 恢复：`./acct.sh list | disable <uid> [原因] | enable <uid> | revive <uid>`（需 `admin.enabled`，走网关管理端点）
 - 领养联动 / 任务查询：`scripts/task_runner.py`（成长任务一体机，默认 dry-run）
+- 可视化面板：`go run ./cmd/dashboard`（缓存命中率 / 速度 / 最近日志 / 账号池一页看，独立进程，见「可视化面板」）
 - 个性化提示词：`prompt.file` 指向自定义提示词文件即整体替换内置默认（`custom`/`append` 模式生效）
 
 ## 架构总览
@@ -178,6 +182,26 @@ curl -s http://localhost:7863/healthz
 > ```bash
 > docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
 > ```
+
+#### 日志持久化（断流 / 告警回查）
+
+默认日志只进 `docker logs`（json-file 驱动）。容器**重建**（`docker compose up` 因镜像/配置变更重建容器）会连带丢弃日志，`upstream truncated`（断流）这类低频 WARN 事后无从回查。开启落盘：
+
+```bash
+mkdir -p ./logs && chown -R 10001:10001 ./logs   # app(uid 10001) 需写权限
+```
+
+在 `config.json` 增加：
+
+```json
+"log_file": "./logs/wb2api.log",
+"log_max_mb": 64
+```
+
+- 日志**同时**写 stderr（`docker logs` 行为不变）与该文件；请求流水行与 `upstream truncated` 等 WARN 落在同一文件，跨容器重建留存。
+- `log_max_mb`（默认 64）为轮转阈值，超过即切一份 `wb2api.log.1`（只留最近一份）。
+- 打开失败只降级为仅 stderr（打一条 WARN），**不会**因日志权限问题拒绝启动。
+- `log_file` 缺省为空 = 关闭（零回归）。`docker-compose.yml` 已挂载 `./logs:/app/logs`。
 
 ### 源码构建
 
@@ -254,6 +278,176 @@ curl -s http://localhost:7863/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
+
+### 可视化面板（独立进程）
+
+网关本身不含 Web UI（见「本项目不做什么」）；配套的独立面板 `cmd/dashboard` 把网关已有的
+数据端点聚合成一页——**缓存命中率**、**速度**（首字 TTFB / 吞吐）、**最近请求日志**、
+**账号池状态**。面板只读、无状态、零第三方依赖，通过服务端代理访问网关（api_key 只留在
+面板进程内，不下发到浏览器，也规避网关无 CORS 头）。
+
+```bash
+# 默认 :7864；网关地址与 key 自动取 config.json（也可用 -gateway / WB2A_URL 覆盖）
+go run ./cmd/dashboard
+go run ./cmd/dashboard -listen :9000 -gateway http://127.0.0.1:7863
+```
+
+然后浏览器打开 `http://127.0.0.1:7864/`。数据来源：
+
+- `GET /v1/stats` — 按模型的请求 / 缓存 / 速度 / 扣费聚合（已有）；
+- `GET /status` — 账号池状态（已有）；
+- `GET /v1/logs?limit=N` — **最近请求流水**（本仓库新增端点）：网关内一份**有界内存
+  环形缓冲**（最近 1000 条，进程重启清零），字段与请求表格日志同构。它不依赖日志文件，
+  `log_file` 为空时照常工作，也不需要面板与网关同机。
+
+页面每 5 秒自动刷新；趋势曲线由面板侧滚动采样（刷新页面即重置）。Docker 部署时
+`docker-compose.yml` 已附带 `dashboard` 服务，访问宿主机 `:7864` 即可。
+
+> `/v1/logs` 是较新的端点：旧版网关会返回 404，页面会给出提示（其余卡片照常显示）。
+
+### Anthropic Messages 兼容接口（Claude Code 直连）
+
+`POST /v1/messages` 提供 Anthropic Messages 协议，供 Claude Code / 官方 Anthropic SDK 直连
+（另附 `POST /v1/messages/count_tokens`）。鉴权两种头都认：`Authorization: Bearer <key>`
+或 `x-api-key: <key>`。实现是一层协议垫片：请求翻译成 chat/completions 后复用同一条上游
+管线（账号池 / 会话粘性 / 前缀缓存 / 指纹清洗 / 错误分类 / 成本账本全部继承）。
+
+模型名决策：**同名家族候选链（免费档优先，用完自动换积分档）**。
+
+客户端只写模型名即可。上游把「同一个模型」拆成了多个各自独立记账的 id——分域
+（`cn:` / `global:`）、分区域变体（`-sg`）、分计费档（`x0.00` 免费 / `x0.03` 积分）。
+网关把这些归到同一条**同名家族**候选链上，按「免费优先 → 倍率升序」排序，**只有当前
+候选在整个池里都拿不到可用账号时**才沿链推进：免费额度在就白嫖，用完自动换积分档。
+国内国外同一套规则，不用手动改配置。
+
+1. **归一化（只作用于客户端入参）**：剥 realm 前缀（`cn:` / `global:`）、区域后缀
+   （`-sg`）、上下文标记（`[1m]` / `[200k]` / `[1000000]`）——都不参与同名判定；
+   出站一律用候选自身的 id（上游只认裸名）。
+2. **候选排序**：`x0.00` 免费档 → 无倍率信息 → 倍率升序；同价时客户端显式写了
+   `realm:` 前缀的那个域优先。注意这是**排序偏好而非硬过滤**——硬过滤会让跨域 /
+   跨档兜底失效。
+3. **`[1M]` 只做档位过滤**：带标记时只留上下文窗口 ≥ 标记值的候选；一个都不满足就
+   退回全部候选（上游没有 1M 版本时按原来的模型跑，不退化成报错）。
+4. **claude\* 兜底**：`claude-sonnet-*` 这类上游并不存在的名字 → 落到配置的默认模型
+   （`anthropic.default_model`，内置 `deepseek-v4.1-flash`）；带 `global:` 前缀时
+   自动映射到国际版的同一模型。
+5. **未收录的模型名原样透传**：目录里没有同名家族 → 单候选透传（只剥 `[1M]` 标记），
+   行为与不引入候选链时逐字一致，网关绝不臆造模型名。
+
+**模型别名**（可选，`config model_aliases`）在候选链**之前**生效，把客户端惯用的短名换成
+真实上游模型名，三条入口（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`）同待遇：
+
+```json
+"model_aliases": { "deepseek-flash": "deepseek-v4.1-flash" }
+```
+
+别名键按同名家族归一化匹配（大小写 / realm 前缀 / `[1M]` 标记 / `-sg` 后缀都不影响命中），
+换名时保留客户端写的前缀与标记：`global:deepseek-flash[1M]` → `global:deepseek-v4.1-flash[1M]`；
+值自带 `realm:` 前缀时以值自身的域为准。
+
+为什么值得配：模型名写错的代价很高——上游回 `11102 service info not found`，网关会把它记成
+该账号的**模型级黑名单**（数小时），后续重试直接退化成 `no_healthy_account`
+（`all accounts are temporarily unavailable`），看起来像账号全挂，实际只是名字写错。
+
+链首即默认出站模型；日志 / 指标记的是**实际出站模型**，所以「免费档用完自动切到积分档」
+在请求流水里直接可见。模型目录由启动预热 + 每 30 分钟续期，chat 热路径只读快照
+（不在请求路径上额外打上游）；快照冷 / 过期时退化为单候选透传，不阻塞请求。
+
+```bash
+# 只写模型名：免费档在就免费，被限流自动换积分档
+curl -s http://HOST:7863/v1/messages -H "x-api-key: $KEY" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"deepseek-v4.1-flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+
+# [1M]：只在 1M 档位的候选里挑（都不满足就退回原模型）
+curl -s http://HOST:7863/v1/messages -H "x-api-key: $KEY" -H "anthropic-version: 2023-06-01" \
+  -d '{"model":"deepseek-v4.1-flash[1M]","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+**缓存在这一层同样是通的**：兼容层把客户端 `metadata.user_id` 映射为出站
+`conversation_id`，会话因此同时拿到账号粘性与稳定的前缀缓存键。多轮对话实测（同一
+`user_id`、前缀逐轮增长）：第 1 轮 `input=1281 / cache_read=0`，第 2、3 轮
+`cache_read=1280`，只有增量部分计费。
+
+```bash
+# Claude Code 直连（Anthropic 协议；x-api-key 与 Authorization 均可）
+curl -sN http://localhost:7863/v1/messages \
+  -H "x-api-key: your-api-key" -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash","max_tokens":1024,"stream":true,
+       "metadata":{"user_id":"user_xxx_session_yyy"},
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+Claude Code 侧（把模型显式设成网关模型名即走透传；不配则默认 `claude-sonnet-*` 走兜底）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:7863
+export ANTHROPIC_API_KEY=your-api-key
+export ANTHROPIC_MODEL=deepseek-v4.1-flash
+```
+
+可选配置：`"anthropic": {"default_model": "deepseek-v4.1-flash"}`（等价环境变量
+`WB2A_ANTHROPIC_MODEL`）；纯国际版部署可直接填带前缀的值，如 `global:deepseek-v4.1-flash`。
+
+### OpenAI Responses 兼容接口（Codex CLI 直连）
+
+`POST /v1/responses` 提供 OpenAI Responses 协议，供 **Codex CLI**（`wire_api = "responses"`）
+直连。鉴权与别的入口一致：`Authorization: Bearer <key>` 或 `x-api-key: <key>`。
+实现同为协议垫片——请求翻译成 chat/completions 后复用同一条上游管线，账号池 / 会话粘性 /
+前缀缓存 / 指纹清洗 / 错误分类 / 成本账本 / **模型别名与同名家族候选链**全部继承。
+
+```toml
+# ~/.codex/config.toml
+model_provider = "workbuddy"
+model = "deepseek-flash"          # 短名走 config model_aliases；也可直接写真实模型名
+
+[model_providers.workbuddy]
+name = "workbuddy"
+base_url = "http://localhost:7863/v1"
+wire_api = "responses"
+env_key = "WB2A_API_KEY"          # 环境变量里放网关 api_key
+```
+
+请求侧翻译：`instructions` → 首条 system；`input` 条目数组里 `message`
+（`developer` 归一为 `system`）→ 角色消息、`function_call` → 并簇进同一条
+`assistant.tool_calls`（并行工具调用的规范形态）、`function_call_output` → 独立
+`role:"tool"` 消息、`reasoning` 条目**丢弃**（上游不认，带签名的形态只在官方侧成立）；
+工具定义摊平的 `name/parameters` → chat 的嵌套 `function` 形态，`namespace` /
+`web_search` / `custom` 等上游无对应物的工具类型整条丢弃（直传会让上游 400 掉整个请求，
+丢弃只是少一个工具）；`reasoning.effort` → 出站 `thinking` + `reasoning_effort`
+（`xhigh`→`high`、`minimal`→`low`）；`text.format` → `response_format`。
+
+`reasoning.effort` 为空时**不开思考**：Codex 常发 `{"summary":"auto"}`，那只表示
+「要不要回传思考摘要」，不是「要不要思考」——见到 `reasoning` 就开思考会让每个请求平白变慢。
+
+响应侧翻译：非流式给单个 `response` resource；流式给完整事件序列
+`response.created` → `response.in_progress` → 每个条目一组
+`output_item.added` / `content_part.added` / `output_text.delta`… / `content_part.done` /
+`output_item.done` → `response.completed`（思考链走 `reasoning` 条目 +
+`reasoning_summary_text.delta`，工具调用走 `function_call` 条目 +
+`function_call_arguments.delta`）；上游流中报错终止为 `response.failed`。usage 口径与
+Anthropic 层**相反**：`input_tokens` 是含缓存的总额，命中部分单列
+`input_tokens_details.cached_tokens`。
+
+**缓存在这一层同样是通的**：Codex 自带 `prompt_cache_key`（= 会话 uuid），网关**原样透传**
+——同一字段同时喂饱会话粘性（`session.ExtractKey` 的 `prompt_cache_key` 兜底）与上游前缀
+缓存键（`InjectPromptCacheKey` 客户端自带即保留）。实测一轮 Codex 会话（两轮请求）
+`cache_hit_rate = 96.9%`（命中 12288 / 未命中 392）。
+
+```bash
+# 非流式（最小探针）
+curl -s http://localhost:7863/v1/responses -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-flash","input":"say ok"}'
+
+# 流式：事件序列与官方一致
+curl -sN http://localhost:7863/v1/responses -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-flash[1M]","stream":true,"input":"hi"}'
+```
+
+模型名与候选链规则和 Anthropic 入口完全一致（同一条候选链实现），`[1M]` 档位标记、
+`global:` 前缀、别名表都照常生效。
 
 ## 安全与合规
 

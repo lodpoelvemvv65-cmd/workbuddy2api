@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -404,5 +405,60 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestChatStatsReaderTruncationSignals 断流观测信号：EOF 而无 [DONE] 必须可判定。
+//
+// 回归锚：透传层（upstream.StreamHint）收尾时无条件补发 [DONE] 且恒返回 nil
+// （见 upstream.TestStreamDoneFallback），断流事实到不了 handler。若不在读取端
+// 自己记录「读到 EOF」与「见过 [DONE]」，生产日志里就永远没有断流的直接证据，
+// 只能靠 usage 缺失间接推断（与"上游本就不给 usage"混为一谈，无法取证）。
+func TestChatStatsReaderTruncationSignals(t *testing.T) {
+	cases := []struct {
+		name              string
+		raw               string
+		wantDone, wantEOF bool
+	}{
+		{
+			name:     "正常收尾（[DONE] 齐备）",
+			raw:      "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+			wantDone: true, wantEOF: true,
+		},
+		{
+			name:     "上游断流（EOF 且无 [DONE]）",
+			raw:      "data: {\"choices\":[{\"delta\":{\"content\":\"半截\"}}]}\n\n",
+			wantDone: false, wantEOF: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newChatStatsReaderSince(strings.NewReader(c.raw), time.Now())
+			_, _ = io.Copy(io.Discard, r)
+			if r.SawDone() != c.wantDone {
+				t.Errorf("SawDone()=%v want %v", r.SawDone(), c.wantDone)
+			}
+			if r.SawEOF() != c.wantEOF {
+				t.Errorf("SawEOF()=%v want %v", r.SawEOF(), c.wantEOF)
+			}
+			// 判据本身：EOF 且无 [DONE] 即断流。
+			truncated := r.SawEOF() && !r.SawDone()
+			if wantTrunc := c.wantEOF && !c.wantDone; truncated != wantTrunc {
+				t.Errorf("truncation=%v want %v", truncated, wantTrunc)
+			}
+		})
+	}
+}
+
+// TestSetStatsOutputRedirectsChatRow 请求流水改道：main 开启 log_file 时经此把表格行
+// 同时写进日志文件；此处验证非 nil writer 生效、nil 复位回 os.Stdout。
+func TestSetStatsOutputRedirectsChatRow(t *testing.T) {
+	withChatLog(t)
+	var buf bytes.Buffer
+	SetStatsOutput(&buf)
+	t.Cleanup(func() { SetStatsOutput(nil) })
+	logChatRow(0, time.Second, "glm-5.2", "sync", "u1", "", 200, 1)
+	if !strings.Contains(buf.String(), "| #") {
+		t.Errorf("SetStatsOutput 未生效，输出=%q", buf.String())
 	}
 }

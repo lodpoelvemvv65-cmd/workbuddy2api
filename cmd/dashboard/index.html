@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorkBuddy2API 面板</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d2129; --border:#2a2f3a;
+    --text:#e6e9ef; --muted:#8b93a3; --accent:#4f8cff; --ok:#3ecf8e;
+    --warn:#f2b34b; --err:#ef5f6b; --cache:#9b7bff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1400px;margin:0 auto;padding:16px 20px 60px}
+  header{display:flex;flex-wrap:wrap;align-items:baseline;gap:12px;margin-bottom:16px}
+  h1{font-size:19px;margin:0;font-weight:650}
+  .meta{color:var(--muted);font-size:12.5px}
+  .meta b{color:var(--text);font-weight:600}
+  .spacer{flex:1}
+  button{background:var(--panel2);color:var(--text);border:1px solid var(--border);
+    border-radius:8px;padding:6px 12px;cursor:pointer;font-size:13px}
+  button:hover{border-color:var(--accent)}
+  .banner{border:1px solid var(--err);background:rgba(239,95,107,.1);color:#ffd9dd;
+    border-radius:8px;padding:8px 12px;margin-bottom:12px;font-size:13px;white-space:pre-wrap}
+  .banner.warn{border-color:var(--warn);background:rgba(242,179,75,.1);color:#ffe9c2}
+  .grid{display:grid;gap:12px}
+  .cards{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:14px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+  .card .k{color:var(--muted);font-size:12px;margin-bottom:6px;letter-spacing:.02em}
+  .card .v{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+  .card .s{color:var(--muted);font-size:11.5px;margin-top:3px}
+  .card.hl{background:linear-gradient(180deg,rgba(155,123,255,.16),rgba(155,123,255,.04));border-color:#4b3f74}
+  .card.hl .v{color:#c9b6ff}
+  .charts{grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-bottom:14px}
+  .chart{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+  .chart .k{color:var(--muted);font-size:12px;display:flex;justify-content:space-between}
+  .chart .k b{color:var(--text);font-variant-numeric:tabular-nums}
+  .chart svg{display:block;width:100%;height:54px;margin-top:8px}
+  section{margin-bottom:18px}
+  section h2{font-size:14px;margin:0 0 8px;font-weight:600;color:#cfd5e0}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .scroll{max-height:420px;overflow:auto}
+  table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+  th,td{padding:7px 10px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--border);font-size:13px}
+  th{position:sticky;top:0;background:var(--panel2);color:var(--muted);font-weight:600;
+    text-align:right;z-index:1;font-size:12px}
+  th:first-child,td:first-child{text-align:left}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11.5px;border:1px solid var(--border)}
+  .pill.ok{color:var(--ok);border-color:rgba(62,207,142,.4);background:rgba(62,207,142,.08)}
+  .pill.warn{color:var(--warn);border-color:rgba(242,179,75,.4);background:rgba(242,179,75,.08)}
+  .pill.err{color:var(--err);border-color:rgba(239,95,107,.4);background:rgba(239,95,107,.08)}
+  .pill.muted{color:var(--muted)}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+  .chip{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12.5px}
+  .chip b{font-size:14px;margin-left:4px}
+  .cachebar{display:flex;height:10px;border-radius:6px;overflow:hidden;background:#242935;margin:8px 0 4px}
+  .cachebar i{display:block;height:100%}
+  .legend{display:flex;gap:14px;color:var(--muted);font-size:12px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px}
+  .empty{color:var(--muted);padding:14px;font-size:13px}
+  .box{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>📊 WorkBuddy2API 面板</h1>
+    <span class="meta" id="meta">加载中…</span>
+    <span class="spacer"></span>
+    <span class="meta" id="tick"></span>
+    <button id="refresh">立即刷新</button>
+  </header>
+
+  <div id="errors"></div>
+
+  <div class="grid cards" id="cards"></div>
+
+  <div class="grid charts">
+    <div class="chart"><div class="k"><span>缓存命中率趋势</span><b id="trend-cache">-</b></div><div id="sp-cache"></div></div>
+    <div class="chart"><div class="k"><span>首字延迟趋势 (TTFB)</span><b id="trend-ttfb">-</b></div><div id="sp-ttfb"></div></div>
+    <div class="chart"><div class="k"><span>吞吐趋势</span><b id="trend-tps">-</b></div><div id="sp-tps"></div></div>
+  </div>
+
+  <section>
+    <h2>缓存明细</h2>
+    <div class="box" id="cacheBox"><div class="empty">等待数据…</div></div>
+  </section>
+
+  <section>
+    <h2>模型统计</h2>
+    <div class="panel scroll"><table id="models">
+      <thead><tr>
+        <th>模型</th><th>请求</th><th>失败</th><th>首字</th><th>耗时</th><th>吞吐</th>
+        <th>输入/输出</th><th>缓存命中</th><th>倍率</th><th>扣费</th><th>最后活动</th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>账号池</h2>
+    <div class="chips" id="poolChips"></div>
+    <div class="panel scroll"><table id="accounts">
+      <thead><tr>
+        <th>账号</th><th>域</th><th>积分</th><th>状态</th><th>在途</th><th>冷却剩余</th><th>累计成功/失败</th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>最近请求日志 <span class="meta" id="logsMeta"></span></h2>
+    <div class="panel scroll" style="max-height:520px"><table id="logs">
+      <thead><tr>
+        <th>时间</th><th>#</th><th>模型</th><th>模式</th><th>状态</th><th>账号</th>
+        <th>TTFB</th><th>tok</th><th>tok/s</th><th>缓存</th><th>耗时</th><th>扣费</th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+</div>
+
+<script>
+"use strict";
+
+const REFRESH_MS = 5000;
+const HISTORY_MAX = 120;           // 面板侧滚动历史（10 分钟 @5s），用于趋势曲线
+const history = { cache: [], ttfb: [], tps: [] };
+let lastStats = null;
+let timer = null, countdown = 0, refreshing = false;
+
+// ── 格式化 ──────────────────────────────────────────────────────────────
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const num = n => (n ?? 0).toLocaleString("en-US");
+function fmtTokens(n) {
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+function fmtMillis(ms) {
+  if (!ms || ms <= 0) return "-";
+  return ms < 1000 ? Math.round(ms) + "ms" : (ms / 1000).toFixed(2) + "s";
+}
+function fmtRate(v) { return v > 0 ? Math.round(v) + " tok/s" : "-"; }
+function pct(v) { return (v > 0 ? (v * 100).toFixed(1) : "0.0") + "%"; }
+function uid8(u) { return u ? u.slice(0, 8) : "-"; }
+function fmtDur(sec) {
+  if (!sec || sec <= 0) return "-";
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = Math.floor(sec % 60);
+  if (h) return h + "h" + m + "m";
+  if (m) return m + "m" + s + "s";
+  return s + "s";
+}
+function fago(iso, now) {
+  if (!iso) return "-";
+  const t = Date.parse(iso); if (isNaN(t)) return "-";
+  let d = (now ? now.getTime() : Date.now()) - t;
+  if (d < 0) d = 0;
+  const s = d / 1000;
+  if (s < 90) return Math.round(s) + "s前";
+  if (s < 5400) return Math.round(s / 60) + "m前";
+  if (s < 172800) return (s / 3600).toFixed(1) + "h前";
+  return Math.round(s / 86400) + "d前";
+}
+
+// ── 数据拉取 ────────────────────────────────────────────────────────────
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((body && body.error) || (url + " → HTTP " + r.status));
+  return body;
+}
+
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  const errors = [];
+  try {
+    const [stats, status, logs] = await Promise.all([
+      getJSON("/api/stats").catch(e => { errors.push("统计: " + e.message); return null; }),
+      getJSON("/api/status").catch(e => { errors.push("账号池: " + e.message); return null; }),
+      getJSON("/api/logs?limit=100").catch(e => { errors.push("日志: " + e.message); return null; }),
+    ]);
+    renderErrors(errors);
+    if (stats) { lastStats = stats; renderStats(stats); }
+    if (status) renderStatus(status);
+    if (logs) renderLogs(logs);
+  } finally {
+    countdown = REFRESH_MS / 1000;
+    refreshing = false;
+  }
+}
+
+function renderErrors(errors) {
+  const el = document.getElementById("errors");
+  if (!errors.length) { el.innerHTML = ""; return; }
+  el.innerHTML = errors.map(e => {
+    const hint = e.includes("404") ? "（网关版本较旧？/v1/logs 需较新版本）" : "";
+    return `<div class="banner">⚠ ${esc(e)}${hint}</div>`;
+  }).join("");
+}
+
+// ── 概览卡片 ────────────────────────────────────────────────────────────
+function renderStats(st) {
+  const t = st.total || {};
+  const now = st.now ? new Date(st.now) : new Date();
+
+  document.getElementById("meta").innerHTML =
+    `统计窗口 <b>${fmtDur(st.uptime_sec)}</b>` +
+    (st.since ? `（自 ${new Date(st.since).toLocaleString("zh-CN", { hour12: false })}）` : "");
+
+  const succ = t.requests ? t.success / t.requests : 0;
+  const badge = t.failed > 0
+    ? `<span class="pill err">失败 ${num(t.failed)}</span>`
+    : `<span class="pill ok">全成功</span>`;
+
+  const cards = [
+    ["请求总数", num(t.requests), badge, ""],
+    ["成功率", pct(succ), `成功 ${num(t.success)} / 失败 ${num(t.failed)}`, ""],
+    ["缓存命中率", pct(t.cache_hit_rate), `命中 ${fmtTokens(t.cache_hit_tokens)} · 未命中 ${fmtTokens(t.cache_miss_tokens)}`, "hl"],
+    ["平均首字", fmtMillis(t.avg_ttfb_ms), "TTFB（流式）", ""],
+    ["平均耗时", fmtMillis(t.avg_latency_ms), "端到端", ""],
+    ["吞吐", fmtRate(t.tokens_per_sec), `输出 ${fmtTokens(t.completion_tokens)} tok`, ""],
+    ["Token 总量", fmtTokens(t.total_tokens), `输入 ${fmtTokens(t.prompt_tokens)}`, ""],
+    ["扣费积分", (t.credit || 0).toFixed(2), `每次 ${(t.credit_per_req || 0).toFixed(3)}`, ""],
+  ];
+  document.getElementById("cards").innerHTML = cards.map(([k, v, s, cls]) =>
+    `<div class="card ${cls}"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`
+  ).join("");
+
+  // 趋势历史（面板侧采样）。
+  pushSample(t);
+  renderSpark("sp-cache", "trend-cache", history.cache, "#9b7bff", v => pct(v));
+  renderSpark("sp-ttfb", "trend-ttfb", history.ttfb, "#4f8cff", v => fmtMillis(v));
+  renderSpark("sp-tps", "trend-tps", history.tps, "#3ecf8e", v => fmtRate(v));
+
+  renderCacheBox(t);
+  renderModels(st.models || [], now);
+}
+
+function pushSample(t) {
+  push(history.cache, t.cache_hit_rate || 0);
+  push(history.ttfb, t.avg_ttfb_ms || 0);
+  push(history.tps, t.tokens_per_sec || 0);
+}
+function push(arr, v) { arr.push(v); if (arr.length > HISTORY_MAX) arr.shift(); }
+
+function renderCacheBox(t) {
+  const hit = t.cache_hit_tokens || 0, miss = t.cache_miss_tokens || 0, wr = t.cache_write_tokens || 0;
+  const denom = hit + miss;
+  if (denom + wr === 0) {
+    document.getElementById("cacheBox").innerHTML = '<div class="empty">窗口内暂无缓存观测（需上游 usage 回传缓存字段）</div>';
+    return;
+  }
+  const hp = denom ? hit / denom * 100 : 0, mp = denom ? miss / denom * 100 : 0;
+  document.getElementById("cacheBox").innerHTML = `
+    <div class="cachebar">
+      <i style="width:${hp}%;background:#9b7bff"></i>
+      <i style="width:${mp}%;background:#3a4152"></i>
+    </div>
+    <div class="legend">
+      <span><span class="dot" style="background:#9b7bff"></span>命中 ${fmtTokens(hit)} tok</span>
+      <span><span class="dot" style="background:#3a4152"></span>未命中 ${fmtTokens(miss)} tok</span>
+      <span><span class="dot" style="background:#f2b34b"></span>写入 ${fmtTokens(wr)} tok</span>
+      <span class="spacer"></span>
+      <span>命中率 ${pct(denom ? hit / denom : 0)}</span>
+    </div>`;
+}
+
+function renderModels(models, now) {
+  const tb = document.querySelector("#models tbody");
+  if (!models.length) { tb.innerHTML = '<tr><td colspan="11" class="empty">暂无请求</td></tr>'; return; }
+  tb.innerHTML = models.map(m => {
+    const cache = (m.cache_hit_tokens + m.cache_miss_tokens) > 0
+      ? pct(m.cache_hit_rate)
+      : "-";
+    const credits = m.credits ? esc(m.credits) : "-";
+    return `<tr>
+      <td class="mono">${esc(m.model)}</td>
+      <td>${num(m.requests)}</td>
+      <td>${m.failed > 0 ? `<span class="pill err">${num(m.failed)}</span>` : "0"}</td>
+      <td>${fmtMillis(m.avg_ttfb_ms)}</td>
+      <td>${fmtMillis(m.avg_latency_ms)}</td>
+      <td>${fmtRate(m.tokens_per_sec)}</td>
+      <td>${fmtTokens(m.prompt_tokens)}/${fmtTokens(m.completion_tokens)}</td>
+      <td>${cache}</td>
+      <td>${credits}</td>
+      <td>${(m.credit || 0).toFixed(2)}</td>
+      <td>${fago(m.last_seen, now)}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── 账号池 ──────────────────────────────────────────────────────────────
+function renderStatus(st) {
+  const trunc = st.upstream_truncated || {};
+  const cn = (st.realm_totals && st.realm_totals.cn) || {};
+  const gl = (st.realm_totals && st.realm_totals.global) || {};
+  document.getElementById("poolChips").innerHTML = `
+    <span class="chip">在线 <b style="color:var(--ok)">${st.healthy ?? "-"}</b></span>
+    <span class="chip">总数 <b>${st.total ?? "-"}</b></span>
+    <span class="chip">冷却 <b style="color:var(--warn)">${st.cooling ?? 0}</b></span>
+    <span class="chip">禁用 <b style="color:var(--err)">${st.disabled ?? 0}</b></span>
+    <span class="chip">在途占满 <b>${st.in_flight_full ?? 0}</b></span>
+    <span class="chip">粘性会话 <b>${st.sticky_sessions ?? 0}</b></span>
+    <span class="chip">CN <b>${cn.healthy ?? 0}/${cn.total ?? 0}</b></span>
+    <span class="chip">Global <b>${gl.healthy ?? 0}/${gl.total ?? 0}</b></span>
+    <span class="chip">Redis <b>${esc(st.redis_mode || "noop")}</b></span>
+    <span class="chip">断流(messages/responses) <b>${trunc.messages ?? 0}/${trunc.responses ?? 0}</b></span>`;
+
+  const accts = (st.accounts || []).slice().sort((a, b) => (b.credits || 0) - (a.credits || 0));
+  const tb = document.querySelector("#accounts tbody");
+  if (!accts.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">无账号</td></tr>'; return; }
+  tb.innerHTML = accts.map(a => {
+    let state;
+    if (a.manual_disabled) state = `<span class="pill muted">手动停用</span>`;
+    else if (a.disabled) state = `<span class="pill err" title="${esc(a.disabled_reason || "")}">禁用</span>`;
+    else if (a.cooling) state = `<span class="pill warn" title="${esc(a.reason || "")}">冷却·${esc(a.cool_kind || "")}</span>`;
+    else if (a.degrade_until) state = `<span class="pill warn">降权中</span>`;
+    else state = `<span class="pill ok">健康</span>`;
+    const label = a.nickname ? `${esc(a.nickname)}(${uid8(a.uid)})` : uid8(a.uid);
+    return `<tr>
+      <td class="mono">${label}</td>
+      <td>${esc(a.realm || "cn")}</td>
+      <td>${num(a.credits)}</td>
+      <td>${state}</td>
+      <td>${a.in_flight ?? 0}</td>
+      <td>${a.cooling ? fmtDur(a.cool_remaining_sec) : "-"}</td>
+      <td>${num(a.success_count)}/${num(a.err_total)}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── 最近日志 ────────────────────────────────────────────────────────────
+function renderLogs(snap) {
+  document.getElementById("logsMeta").textContent =
+    `缓冲 ${snap.count}/${snap.capacity} · 累计 ${num(snap.total)}`;
+  const entries = snap.entries || [];
+  const tb = document.querySelector("#logs tbody");
+  if (!entries.length) { tb.innerHTML = '<tr><td colspan="12" class="empty">暂无请求</td></tr>'; return; }
+  const now = lastStats && lastStats.now ? new Date(lastStats.now) : new Date();
+  tb.innerHTML = entries.map(e => {
+    const t = new Date(e.time);
+    const hhmmss = isNaN(t) ? "-" : t.toLocaleTimeString("zh-CN", { hour12: false });
+    const statusCls = e.status >= 200 && e.status < 300 ? "ok" : (e.status >= 500 ? "err" : "warn");
+    const account = e.nickname ? `${esc(e.nickname)}(${uid8(e.uid)})` : uid8(e.uid);
+    let cache = "-";
+    if (e.has_usage && (e.cache_hit_tokens + e.cache_miss_tokens) > 0) {
+      cache = pct(e.cache_hit_tokens / (e.cache_hit_tokens + e.cache_miss_tokens));
+    }
+    const toks = e.completion_tokens < 0 ? "-" : num(e.completion_tokens);
+    const rate = e.tokens_per_sec > 0 ? Math.round(e.tokens_per_sec) + " tok/s" : "-";
+    return `<tr>
+      <td class="mono">${hhmmss}</td>
+      <td class="mono">#${e.seq}</td>
+      <td class="mono">${esc(e.model)}</td>
+      <td>${esc(e.mode)}</td>
+      <td><span class="pill ${statusCls}">${e.status}</span></td>
+      <td>${account}</td>
+      <td>${e.ttfb_ms ? e.ttfb_ms + "ms" : "-"}</td>
+      <td>${toks}</td>
+      <td>${rate}</td>
+      <td>${cache}</td>
+      <td>${fmtMillis(e.duration_ms)}</td>
+      <td>${e.has_credit ? e.credit.toFixed(3) : "-"}</td>
+    </tr>`;
+  }).join("");
+}
+
+// ── Sparkline ───────────────────────────────────────────────────────────
+function renderSpark(containerId, labelId, values, color, fmt) {
+  const el = document.getElementById(containerId);
+  const label = document.getElementById(labelId);
+  const cur = values.length ? values[values.length - 1] : 0;
+  label.textContent = fmt(cur);
+  if (values.length < 2) {
+    el.innerHTML = '<svg viewBox="0 0 100 40"></svg>';
+    return;
+  }
+  const W = 100, H = 40, pad = 3;
+  let min = Math.min(...values), max = Math.max(...values);
+  if (max - min < 1e-9) { max += 1; min -= 1; }
+  const n = values.length;
+  const x = i => pad + (W - pad * 2) * (i / (n - 1));
+  const y = v => H - pad - (H - pad * 2) * ((v - min) / (max - min));
+  const pts = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const area = `${pad},${H - pad} ${pts} ${W - pad},${H - pad}`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <polygon points="${area}" fill="${color}" opacity="0.12"></polygon>
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.6"
+      vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"></polyline>
+    <circle cx="${x(n - 1).toFixed(1)}" cy="${y(values[n - 1]).toFixed(1)}" r="2" fill="${color}"></circle>
+  </svg>`;
+}
+
+// ── 轮询 ────────────────────────────────────────────────────────────────
+function tick() {
+  countdown--;
+  document.getElementById("tick").textContent = `⌁ ${countdown}s 后刷新`;
+  if (countdown <= 0 && !refreshing) refresh();
+}
+
+document.getElementById("refresh").addEventListener("click", refresh);
+refresh();
+timer = setInterval(tick, 1000);
+window.addEventListener("beforeunload", () => clearInterval(timer));
+</script>
+</body>
+</html>

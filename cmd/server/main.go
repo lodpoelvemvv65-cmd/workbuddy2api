@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -44,6 +45,20 @@ func main() {
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
+		}
+	}
+
+	// 日志落盘（config log_file，默认为空 = 仅 stderr / docker logs）。开启后镜像一份到
+	// 宿主挂载目录，容器重建也不丢断流/降级类低频告警；请求流水也接到同一文件，
+	// 便于把 WARN 与具体请求行对照回查。打开失败只降级不致命。
+	logFileW, closeLog, logErr := setupFileLog(cfg.LogFile, cfg.LogMaxMB)
+	if logErr != nil {
+		log.Printf("WARN: [server] log_file %q 打开失败，降级为仅 stderr：%v", cfg.LogFile, logErr)
+	} else {
+		defer closeLog()
+		if logFileW != nil {
+			server.SetStatsOutput(io.MultiWriter(os.Stdout, logFileW))
+			log.Printf("日志镜像到 %s（阈值 %dMB，轮转保留 .1）", cfg.LogFile, cfg.LogMaxMB)
 		}
 	}
 
@@ -206,10 +221,17 @@ func main() {
 		SoftCooldown: cfg.SoftRateDur,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
+		// /v1/messages 兼容层的 claude* 映射目标（空 = server 包内置默认）。
+		AnthropicDefaultModel: cfg.Anthropic.DefaultModel,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
+		// 模型别名表（config model_aliases）：客户端惯用短名 → 真实上游模型名。
+		ModelAliases: cfg.ModelAliases,
+		// 冷快照后台补预热（见 server.Config.ColdCatalogWarm 注释）。生产恒开：
+		// 启动预热 + 30min 续期之外，请求路径上再补一道，覆盖"首个请求早于预热完成"。
+		ColdCatalogWarm: true,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -249,6 +271,24 @@ func main() {
 	} else {
 		log.Printf("global realm 已禁用（config global.enabled=false，纯 CN）")
 	}
+	// 模型目录预热：modelChain（同名家族 → 免费优先/积分兜底 的候选链）在 chat 路径上
+	// 只读快照，要求两张目录（CN 动态表 / global 探测表）已被预热。启动即拉一次，
+	// 之后每 30 分钟续一次 TTL（两侧目录 TTL 均为 1h，留足抖动余量）。
+	// 放后台：拉取慢/失败都不能拖住监听；失败由目录自带负缓存接管，下一轮重试。
+	go func() {
+		h.WarmModelCatalog()
+		t := time.NewTicker(30 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				h.WarmModelCatalog()
+			}
+		}
+	}()
+
 	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
