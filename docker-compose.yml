@@ -5,9 +5,9 @@ services:
       args:
         # 可选：Go 模块代理。官方 proxy.golang.org 在中国大陆不可达 —— 构建第一步
         # 就是 `go mod download`，会长时间卡在这一层（看着像构建挂了），有时直接失败。
-        # 国内构建填 https://goproxy.cn,direct（或 https://mirrors.aliyun.com/goproxy/）。
-        # 留空 = 官方默认，行为与上游原版一致。
-        GOPROXY: ""
+        # 默认走国内 goproxy.cn（可换 https://mirrors.aliyun.com/goproxy/）；
+        # 要回落官方默认改成 ""。
+        GOPROXY: "https://goproxy.cn,direct"
     container_name: workbuddy2api
     restart: unless-stopped
     environment:

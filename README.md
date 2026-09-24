@@ -175,17 +175,17 @@ curl -s http://localhost:7863/healthz
 
 `login.sh` 内置授权 URL 获取 + 浏览器登录 + token 轮询 + 首次签到 + `auths/workbuddy-<uid>.json` 落盘 + 容器重启，全程无 PKCE（state 由服务端签发）。账号池在容器启动时用 `auths/` 目录自动对齐，新增凭证文件即自动发现。
 
-> **国内网络下构建会卡在第一层**：镜像构建的第一步是 `go mod download`，默认走官方
-> `proxy.golang.org` —— 中国大陆不可达，表现为长时间停在这一层（看着像构建挂了），
-> 有时直接失败。换个国内代理即可：
+> **国内网络下构建**：镜像构建的第一步是 `go mod download`，官方 `proxy.golang.org`
+> 在中国大陆不可达，会长时间停在这一层（看着像构建挂了）。本仓库**默认已切国内镜像**
+> `goproxy.cn`，开箱即可构建；需要换源或回落官方默认时覆盖 `GOPROXY`：
 >
 > ```bash
-> docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
-> docker compose up -d
+> docker compose build --build-arg GOPROXY=https://mirrors.aliyun.com/goproxy/
+> # 回落官方默认（中国大陆会卡）：
+> docker compose build --build-arg GOPROXY=
 > ```
 >
-> 也可以直接填进 `docker-compose.yml` 的 `build.args.GOPROXY`。留空 = 官方默认，
-> 与改动前行为一致。
+> 也可以直接改 `docker-compose.yml` 的 `build.args.GOPROXY`。
 
 > **非 root 宿主用户注意**：`./login.sh` 以**当前宿主用户**落盘凭证（权限 0600），而容器内网关以 `app(uid 10001)` 读 + 回写（refresh / realm 补标识走 tmp+rename，需要目录写权限）。二者 uid 不同（例如 Linux 非 root 账号通常是 uid 1000）时容器读不到凭证文件，`/status` 账号数为 0——与 `./data` 卷的属主问题同源。登录后、启动前把目录属主交给 10001（root 或部署用户执行）：
 >

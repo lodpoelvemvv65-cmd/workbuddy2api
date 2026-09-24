@@ -1,15 +1,12 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.26-alpine AS build
-# 国内网络直连 proxy.golang.org 会 i/o timeout，默认切 goproxy.cn。
-# 需要换源用 --build-arg GOPROXY=<...> 或 compose 的 build.args 覆盖。
+# 可选：Go 模块代理。官方 proxy.golang.org 在中国大陆不可达 —— 构建第一步
+# `go mod download` 会长时间卡住（看着像构建挂了），有时直接失败。
+# 默认走国内 goproxy.cn；要回落官方默认，显式传空：--build-arg GOPROXY=
+# （或 docker-compose.yml 的 build.args.GOPROXY: ""）。
 ARG GOPROXY=https://goproxy.cn,direct
-ENV GOPROXY=${GOPROXY}
-WORKDIR /src
-# 可选：Go 模块代理。官方 proxy.golang.org 在中国大陆不可达（go mod download
-# 会卡死）；国内机器构建时传 --build-arg GOPROXY=https://goproxy.cn,direct。
-# 留空 = 官方默认，行为与上游原版一致。
-ARG GOPROXY=""
 RUN test -z "${GOPROXY}" || go env -w GOPROXY="${GOPROXY}"
+WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
