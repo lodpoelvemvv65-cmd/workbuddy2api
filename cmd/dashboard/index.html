@@ -70,6 +70,7 @@
 <div class="wrap">
   <header>
     <h1>📊 WorkBuddy2API 面板</h1>
+    <span class="meta" id="clock" title="网关服务器时间（每秒刷新）">当前时间 -</span>
     <span class="meta" id="meta">加载中…</span>
     <span class="spacer"></span>
     <span class="meta" id="tick"></span>
@@ -130,6 +131,7 @@ const HISTORY_MAX = 120;           // 面板侧滚动历史（10 分钟 @5s）�
 const history = { cache: [], ttfb: [], tps: [] };
 let lastStats = null;
 let timer = null, countdown = 0, refreshing = false;
+let serverOffsetMs = 0;            // 网关服务器时间 − 浏览器时间（每次刷新校准）
 
 // ── 格式化 ──────────────────────────────────────────────────────────────
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c =>
@@ -155,6 +157,15 @@ function fmtDur(sec) {
   if (h) return h + "h" + m + "m";
   if (m) return m + "m" + s + "s";
   return s + "s";
+}
+
+// updateClock 显示「当前时间」——用服务器 now 校准出的偏移量每秒走动。
+// 显示的是网关服务器时间（与统计窗口同一时钟），而非浏览器本地时间。
+function updateClock() {
+  const el = document.getElementById("clock");
+  if (!el) return;
+  el.textContent = "当前时间 " + new Date(Date.now() + serverOffsetMs)
+    .toLocaleString("zh-CN", { hour12: false });
 }
 function fago(iso, now) {
   if (!iso) return "-";
@@ -217,10 +228,12 @@ function renderErrors(errors) {
 function renderStats(st) {
   const t = st.total || {};
   const now = st.now ? new Date(st.now) : new Date();
+  serverOffsetMs = st.now ? (now.getTime() - Date.now()) : 0;   // 用服务器 now 校准时钟
 
   document.getElementById("meta").innerHTML =
     `统计窗口 <b>${fmtDur(st.uptime_sec)}</b>` +
     (st.since ? `（自 ${new Date(st.since).toLocaleString("zh-CN", { hour12: false })}）` : "");
+  updateClock();
 
   const succ = t.requests ? t.success / t.requests : 0;
   const badge = t.failed > 0
@@ -433,11 +446,13 @@ function renderSpark(containerId, labelId, values, color, fmt) {
 // ── 轮询 ────────────────────────────────────────────────────────────────
 function tick() {
   countdown--;
+  updateClock();
   document.getElementById("tick").textContent = `⌁ ${countdown}s 后刷新`;
   if (countdown <= 0 && !refreshing) refresh();
 }
 
 document.getElementById("refresh").addEventListener("click", refresh);
+updateClock();
 refresh();
 timer = setInterval(tick, 1000);
 window.addEventListener("beforeunload", () => clearInterval(timer));
