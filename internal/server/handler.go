@@ -1069,8 +1069,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 流有内容帧却缺末帧 usage：上游大概率在收尾前被掐断（正常流末帧必带
 				// usage，见 upstream 收尾段）。在此之前该形态零痕迹——日志只显示
 				// tok=-，与"usage 未观测"混为一谈，断流时无从取证。
-				log.Printf("WARN: [server] stream ended without usage acct=%s model=%s (possible upstream truncation)",
-					logfmt.Label(acct.UID, acct.Nickname), bareModel)
+				//
+				// 带上收尾形态四要素，把「上游掐流」与「客户端自己退出」分开（两者
+				// 在协议层都表现为无 finish_reason 的断流计数，事后无从区分）：
+				//
+				//	saw_done=true                → 上游发了 [DONE] 但没给 finish_reason/usage
+				//	                              （上游内部异常，优雅结束但内容不完整）；
+				//	saw_eof=true, saw_done=false → 上游干净 EOF 却无 [DONE]（未发完就关）；
+				//	两者皆 false, client_gone=T  → 客户端主动取消（r.Context 已取消）；
+				//	两者皆 false, client_gone=F  → 连接被 RST / 空闲掐流（err 看原文）。
+				// err 是透传层原样回传的读错误：StreamHint 此前只认空流哨兵、其余错误
+				// 静默丢弃，非 EOF 中断在日志里没有任何痕迹。
+				log.Printf("WARN: [server] stream ended without usage acct=%s model=%s saw_done=%v saw_eof=%v client_gone=%v err=%v (possible upstream truncation)",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, stats.SawDone(), stats.SawEOF(), r.Context().Err() != nil, sErr)
 			}
 			// 上游断流的**直接证据**：读到 EOF 却从未见 [DONE]（实测正常流必然两者齐备）。
 			// 必须在这里判定——透传层（upstream.StreamHint）收尾时无条件补发 [DONE]
