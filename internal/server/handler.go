@@ -193,24 +193,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // setCORS 给所有响应补宽松 CORS 头，让浏览器可从任意源直连网关。
 //
-// 为什么可以放心用 `*`：本网关的鉴权是**请求头里的 api_key**（Authorization /
-// X-Api-Key），不是 cookie，浏览器不会自动携带；因此 `*` 不产生凭证型 CSRF，
-// 未带 key 的跨源请求照样 401。也正因不用 cookie，无需（也不应）回
-// Access-Control-Allow-Credentials。
+// 鉴权是**请求头里的 api_key**（Authorization / X-Api-Key），不是 cookie，浏览器
+// 不会自动携带；因此放宽 CORS 不产生凭证型 CSRF，未带 key 的跨源请求照样 401。
+//
+// 三条容易踩的浏览器规则这里都覆盖（都是「无法连接模型服务」的实际来源）：
+//  1. Origin 回显而非固定 `*`：网页版客户端常用 fetch(credentials:'include')，
+//     规范要求此时 Allow-Origin 必须是具体源且 Allow-Credentials: true，`*` 会被
+//     浏览器直接拒绝。回显对不带凭证的请求同样有效，故统一回显。
+//  2. Private Network Access：HTTPS 页面访问本机 / 私网 HTTP 网关时，Chrome 预检
+//     会带 Access-Control-Request-Private-Network，服务端不回 Allow 头就被拦。
+//  3. Access-Control-Request-Headers 回显：Authorization / X-Api-Key /
+//     anthropic-version / x-stainless-* 等各家头差异大，回显最不容易漏。
 func setCORS(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
-	h.Set("Access-Control-Allow-Origin", "*")
+	if origin := r.Header.Get("Origin"); origin != "" {
+		h.Set("Access-Control-Allow-Origin", origin)
+		h.Set("Access-Control-Allow-Credentials", "true")
+		h.Add("Vary", "Origin") // 回显随 Origin 变化，避免被缓存串味
+	} else {
+		// 非浏览器（curl / SDK）不看 CORS 头；无 Origin 时用 `*` 保持原行为。
+		h.Set("Access-Control-Allow-Origin", "*")
+	}
 	h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	// 预检请求会声明它实际要用到的头；回显最省事也最不容易漏——各家客户端差异大
-	// （Authorization / X-Api-Key / anthropic-version / x-stainless-* 等）。
 	if req := r.Header.Get("Access-Control-Request-Headers"); req != "" {
 		h.Set("Access-Control-Allow-Headers", req)
+		h.Add("Vary", "Access-Control-Request-Headers")
 	} else {
 		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Accept")
 	}
 	h.Set("Access-Control-Max-Age", "86400")
-	// 让浏览器能读到自定义响应头（如 X-Service）。
-	h.Set("Access-Control-Expose-Headers", "*")
+	// 让浏览器能读到自定义响应头。带凭证时 `*` 不被展开，故显式列名。
+	h.Set("Access-Control-Expose-Headers", "X-Service, X-Wb-Account")
+	// Private Network Access 预检：仅在被询问时回，避免无谓放宽。
+	if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+		h.Set("Access-Control-Allow-Private-Network", "true")
+	}
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
