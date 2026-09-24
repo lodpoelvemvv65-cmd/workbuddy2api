@@ -112,3 +112,21 @@ func TestModelJSONPath(t *testing.T) {
 		}
 	}
 }
+
+// TestMetricsJSONPath metrics.json 路径推导（/v1/stats 持久化接线）：与 state.json
+// 同目录同名换缀（Docker ./data volume）；空 state 路径 → 空串（纯内存旧行为）。
+func TestMetricsJSONPath(t *testing.T) {
+	cases := []struct {
+		state, want string
+	}{
+		{"./data/state.json", "data/metrics.json"},
+		{"/app/data/state.json", "/app/data/metrics.json"},
+		{"state.json", "metrics.json"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := filepath.ToSlash(metricsJSONPath(c.state)); got != c.want {
+			t.Errorf("metricsJSONPath(%q)=%q want %q", c.state, got, c.want)
+		}
+	}
+}

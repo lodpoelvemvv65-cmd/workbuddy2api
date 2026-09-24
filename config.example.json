@@ -3,6 +3,8 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "metrics_persist": true,
+  "metrics_file": "",
   "log_file": "",
   "log_max_mb": 64,
   "cooldown": {

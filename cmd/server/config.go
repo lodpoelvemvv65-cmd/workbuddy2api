@@ -19,6 +19,13 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+	// MetricsFile /v1/stats 请求统计的持久化路径。空 = 派生：与 state_file 同目录的
+	// metrics.json（Docker ./data volume）。容器/进程重启后累计量与统计窗口延续，
+	// 不再清零（见 internal/server/metrics.go 的 StartMetricsPersistence）。
+	MetricsFile string `json:"metrics_file"`
+	// MetricsPersist 是否持久化请求统计（默认 true）。显式 false = 纯内存旧行为
+	// （进程重启清零）；metrics_file 为空且 state_file 也为空时无路径可落，等效关闭。
+	MetricsPersist bool `json:"metrics_persist"`
 	// LogFile 日志落盘路径（stderr 之外再镜像一份到该文件，便于容器重建后回查
 	// 断流/告警）。空 = 关闭（默认，仅 stderr，即 docker logs）。打开失败不致命——
 	// 打一条 WARN 后降级为仅 stderr，绝不因日志权限问题拒绝启动。
@@ -198,6 +205,9 @@ func Default() *Config {
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
+		// 请求统计默认持久化（与 state.json 同目录 metrics.json）：容器重启后
+		// /v1/stats 累计量与统计窗口延续，不必从零重新计数。显式 false 关闭。
+		MetricsPersist: true,
 		// LogFile 缺省空 = 不落盘（零回归：默认行为仍是纯 stderr / docker logs）。
 		LogMaxMB: 64,
 	}
@@ -273,6 +283,14 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
+	}
+	if v := os.Getenv("WB2A_METRICS_FILE"); v != "" {
+		c.MetricsFile = v
+	}
+	if v := os.Getenv("WB2A_METRICS_PERSIST"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.MetricsPersist = b
+		}
 	}
 	if v := os.Getenv("WB2A_LOG_FILE"); v != "" {
 		c.LogFile = v

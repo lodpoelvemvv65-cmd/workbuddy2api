@@ -8,12 +8,17 @@
 //   - **按模型聚合**：模型名含 realm 前缀原样入键（global:xxx 与裸名分开统计）。
 //   - **有界内存**：模型键数量受上游目录限制（不是无界增长）；另设容量上限兜底，
 //     超限时丢弃新键并记一次 WARN，避免异常模型名刷爆内存。
-//   - **零外部依赖**：纯内存累加，进程重启即清零（since 随进程启动时间）。
+//   - **可选持久化**：main 通过 StartMetricsPersistence 接线后，聚合落盘到 state.json
+//     同目录的 metrics.json，容器/进程重启后累计量与统计窗口延续；未接线（path 为空）
+//     时保持纯内存累加、进程重启即清零的旧行为。
 package server
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -49,6 +54,44 @@ type metricsStore struct {
 	since   time.Time
 	byModel map[string]*modelMetrics
 	warned  bool // 容量超限只告警一次，避免刷屏
+
+	// 持久化（path 为空 = 关闭，纯内存旧行为）。path/dirty/persistFails 均在 mu 下读写。
+	path         string
+	dirty        bool // 内存有变更待落盘
+	persistFails int  // 连续落盘失败计数（日志节流用）
+}
+
+// metricsPersistInterval 后台落盘周期。统计是低频观测，5s 粒度足够，且与请求热路径
+// 解耦（recordChatMetric 只置脏，落盘在后台 goroutine 做）。var 便于测试缩短。
+var metricsPersistInterval = 5 * time.Second
+
+// metricsPersistLogEvery 连续落盘失败每 N 次打一条提醒，避免磁盘满/权限丢失时刷屏。
+const metricsPersistLogEvery = 100
+
+// persistedMetrics / persistedModelMetrics 是 metricsStore 的落盘形态。modelMetrics
+// 字段未导出（JSON 不能直接编解码），故单列一份镜像结构，字段与内存累加器一一对应，
+// 不做语义转换（均值/比率/吞吐等派生量仍在读取出口折算）。
+type persistedMetrics struct {
+	Since  time.Time                        `json:"since"`
+	Models map[string]persistedModelMetrics `json:"models"`
+}
+
+type persistedModelMetrics struct {
+	Requests   int64     `json:"requests"`
+	Success    int64     `json:"success"`
+	Failed     int64     `json:"failed"`
+	Streaming  int64     `json:"streaming"`
+	TTFBSumMS  float64   `json:"ttfb_sum_ms"`
+	TTFBCount  int64     `json:"ttfb_count"`
+	LatSumMS   float64   `json:"lat_sum_ms"`
+	GenSecSum  float64   `json:"gen_sec_sum"`
+	PromptTok  int64     `json:"prompt_tokens"`
+	CompTok    int64     `json:"completion_tokens"`
+	CacheHit   int64     `json:"cache_hit_tokens"`
+	CacheMiss  int64     `json:"cache_miss_tokens"`
+	CacheWrite int64     `json:"cache_write_tokens"`
+	Credit     float64   `json:"credit"`
+	LastSeen   time.Time `json:"last_seen"`
 }
 
 var globalMetrics = &metricsStore{
@@ -129,6 +172,7 @@ func recordChatMetric(s *chatStat, total time.Duration) {
 	}
 
 	mm.lastSeen = time.Now()
+	m.markDirtyLocked()
 }
 
 // MetricsSnapshot 是 /v1/stats 的响应载荷（字段名与社区面板约定一致）。
@@ -269,6 +313,187 @@ func ResetMetrics() {
 	m.byModel = make(map[string]*modelMetrics)
 	m.since = time.Now()
 	m.warned = false
+	m.markDirtyLocked()
+}
+
+// FlushMetrics 同步把统计落盘（幂等：无变更不写）。供 /v1/stats/reset 与进程退出前调用。
+func FlushMetrics() {
+	globalMetrics.flush()
+}
+
+// StartMetricsPersistence 开启 /v1/stats 聚合的本地持久化：启动时加载 path（缺失/
+// 损坏静默零状态），并起后台周期落盘 goroutine。返回停止函数（停 goroutine + 末次
+// 落盘），供 main 的 defer 调用；path 为空时返回空操作（纯内存旧行为）。
+//
+// 与 pool 的 state.json 落盘同风格：原子写（tmp+rename）、失败节流日志、dirty 标志。
+// 独立于 pool：metrics 属于 server 包聚合，生命周期由 server 包自管，不跨包耦合。
+func StartMetricsPersistence(path string) func() {
+	if path == "" {
+		return func() {}
+	}
+	m := globalMetrics
+	m.mu.Lock()
+	m.path = path
+	m.loadLocked()
+	m.mu.Unlock()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(metricsPersistInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				m.flush()
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+			m.flush() // 末次落盘：停 goroutine 后补一笔，避免最后 5s 窗口丢观测
+			// 关闭后清空路径，回到纯内存态（幂等语义：stop 即彻底停用持久化）。
+			m.mu.Lock()
+			m.path = ""
+			m.dirty = false
+			m.persistFails = 0
+			m.mu.Unlock()
+		})
+	}
+}
+
+// markDirtyLocked 置脏（仅持久化开启时）。调用方必须已持 m.mu。
+func (m *metricsStore) markDirtyLocked() {
+	if m.path != "" {
+		m.dirty = true
+	}
+}
+
+// flush 若有变更则落盘。调用方无需持锁。
+func (m *metricsStore) flush() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.dirty || m.path == "" {
+		return
+	}
+	m.dirty = false
+	m.saveLocked()
+}
+
+// loadLocked 从 path 读回统计（无文件/解析失败静默跳过，保持零状态启动）。
+// 容量超限时截断（与 recordChatMetric 同上限），破损负计数条目剔除。调用方必须已持 m.mu。
+func (m *metricsStore) loadLocked() {
+	raw, err := os.ReadFile(m.path)
+	if err != nil {
+		return
+	}
+	var pm persistedMetrics
+	if json.Unmarshal(raw, &pm) != nil {
+		return
+	}
+	if !pm.Since.IsZero() {
+		m.since = pm.Since // 统计窗口跨重启延续（不再随进程启动时间重置）
+	}
+	if len(pm.Models) == 0 {
+		return
+	}
+	if m.byModel == nil {
+		m.byModel = make(map[string]*modelMetrics)
+	}
+	for name, p := range pm.Models {
+		if len(m.byModel) >= metricsCap {
+			break
+		}
+		// 结构破损/非法值剔除（state.json 手工脏数据防御，与 pool 的恢复侧同纪律）：
+		// 真值只可能 ≥0，负计数一律视为损坏条目不复活。
+		if p.Requests < 0 || p.Success < 0 || p.Failed < 0 || p.Streaming < 0 ||
+			p.TTFBCount < 0 || p.PromptTok < 0 || p.CompTok < 0 ||
+			p.CacheHit < 0 || p.CacheMiss < 0 || p.CacheWrite < 0 {
+			continue
+		}
+		m.byModel[name] = &modelMetrics{
+			requests:   p.Requests,
+			success:    p.Success,
+			failed:     p.Failed,
+			streaming:  p.Streaming,
+			ttfbSumMS:  p.TTFBSumMS,
+			ttfbCount:  p.TTFBCount,
+			latSumMS:   p.LatSumMS,
+			genSecSum:  p.GenSecSum,
+			promptTok:  p.PromptTok,
+			compTok:    p.CompTok,
+			cacheHit:   p.CacheHit,
+			cacheMiss:  p.CacheMiss,
+			cacheWrite: p.CacheWrite,
+			credit:     p.Credit,
+			lastSeen:   p.LastSeen,
+		}
+	}
+}
+
+// saveLocked 把内存统计原子落盘（tmp + rename）。失败走节流日志。调用方必须已持 m.mu。
+func (m *metricsStore) saveLocked() {
+	if m.path == "" {
+		return
+	}
+	pm := persistedMetrics{Since: m.since, Models: make(map[string]persistedModelMetrics, len(m.byModel))}
+	for name, mm := range m.byModel {
+		pm.Models[name] = persistedModelMetrics{
+			Requests:   mm.requests,
+			Success:    mm.success,
+			Failed:     mm.failed,
+			Streaming:  mm.streaming,
+			TTFBSumMS:  mm.ttfbSumMS,
+			TTFBCount:  mm.ttfbCount,
+			LatSumMS:   mm.latSumMS,
+			GenSecSum:  mm.genSecSum,
+			PromptTok:  mm.promptTok,
+			CompTok:    mm.compTok,
+			CacheHit:   mm.cacheHit,
+			CacheMiss:  mm.cacheMiss,
+			CacheWrite: mm.cacheWrite,
+			Credit:     mm.credit,
+			LastSeen:   mm.lastSeen,
+		}
+	}
+	raw, err := json.MarshalIndent(pm, "", "  ")
+	if err != nil {
+		m.notePersistFailLocked(err)
+		return
+	}
+	if dir := filepath.Dir(m.path); dir != "" {
+		_ = os.MkdirAll(dir, 0o755)
+	}
+	tmp := m.path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		m.notePersistFailLocked(err)
+		return
+	}
+	if err := os.Rename(tmp, m.path); err != nil {
+		m.notePersistFailLocked(err)
+		return
+	}
+	if m.persistFails > 0 {
+		log.Printf("[metrics] %s 落盘恢复（此前连续失败 %d 次）", m.path, m.persistFails)
+		m.persistFails = 0
+	}
+}
+
+// notePersistFailLocked 记录一次落盘失败，首败详报 + 每 metricsPersistLogEvery 次复报，
+// 避免刷屏（与 pool 的 state.json 落盘失败节流同范式）。调用方必须已持 m.mu。
+func (m *metricsStore) notePersistFailLocked(err error) {
+	if m.persistFails == 0 {
+		log.Printf("WARN: [metrics] 统计落盘失败（首次详报）: path=%s err=%v（目录需可写，见 docker-compose 的 ./data 属主说明）", m.path, err)
+	} else if m.persistFails%metricsPersistLogEvery == 0 {
+		log.Printf("ERR: [metrics] 统计连续落盘失败 %d 次: path=%s err=%v", m.persistFails, m.path, err)
+	}
+	m.persistFails++
 }
 
 // logMetricsCapWarn 容量超限告警（独立函数便于测试替换/断言，也避免 import log 污染
@@ -354,7 +579,9 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 }
 
 // statsReset 处理 POST /v1/stats/reset：清空累计，便于观察增量。
+// 同步落盘一次：重置结果必须立即持久化，否则崩溃/重启后旧数据会「复活」。
 func (h *Handler) statsReset(w http.ResponseWriter, r *http.Request) {
 	ResetMetrics()
+	FlushMetrics()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

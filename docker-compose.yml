@@ -18,7 +18,7 @@ services:
       #   docker compose exec -it wb2api bash -c './login.sh' && docker compose restart wb2api
       - ./auths:/app/auths
       # data 保持 bind mount（本地映射，与旧版本一致）。
-      # 若容器内 app(uid 10001) 写 state.json 报 permission denied，宿主机执行：
+      # 若容器内 app(uid 10001) 写 state.json / metrics.json 报 permission denied，宿主机执行：
       #   chown -R 10001:10001 ./data
       - ./data:/app/data
       - ./config.json:/app/config.json:ro

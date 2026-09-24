@@ -32,6 +32,16 @@ func modelJSONPath(stateFile string) string {
 	return filepath.Join(filepath.Dir(stateFile), "model.json")
 }
 
+// metricsJSONPath 由 state.json 路径推导 metrics.json 路径（同目录同名换缀）：与
+// state.json / model.json 同为数据目录持久化物（Docker ./data volume）。state 路径为
+// 空（纯内存测试形态）→ 空 = 不落盘（保持纯内存旧行为）。
+func metricsJSONPath(stateFile string) string {
+	if stateFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(stateFile), "metrics.json")
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
@@ -76,6 +86,23 @@ func main() {
 	// state.json 同风格（Docker volume 持久化路径 ./data）。首次缺失/损坏自动回落
 	// 仓库种子 embed；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(modelJSONPath(cfg.StateFile))
+
+	// 请求统计（/v1/stats）持久化：默认落盘 state.json 同目录 metrics.json（Docker
+	// ./data volume），容器/进程重启后累计量与统计窗口延续，不再从零重新计数。
+	// metrics_persist=false 关闭（纯内存旧行为）；metrics_file 非空可显式指定路径。
+	if cfg.MetricsPersist {
+		metricsPath := cfg.MetricsFile
+		if metricsPath == "" {
+			metricsPath = metricsJSONPath(cfg.StateFile)
+		}
+		stopMetrics := server.StartMetricsPersistence(metricsPath)
+		defer stopMetrics()
+		if metricsPath != "" {
+			log.Printf("请求统计持久化到 %s（重启延续；metrics_persist=false 可关闭）", metricsPath)
+		} else {
+			log.Printf("请求统计持久化已跳过：state_file 与 metrics_file 均为空")
+		}
+	}
 
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)

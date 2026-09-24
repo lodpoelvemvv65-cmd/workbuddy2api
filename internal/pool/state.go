@@ -486,7 +486,6 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		LastSuccessTime:   e.lastSuccess,
 		LastErrTime:       e.lastErr,
 		ConsecutiveFails:  e.consecutiveFails,
-		DegradeUntil:      e.degradeUntil,
 		Until:             e.until,
 		SoftStreak:        e.softStreak,
 		InFlight:          int(e.inFlight.Load()),
@@ -501,6 +500,12 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 手动停用原因。与 DisabledReason 分开两个字段：叠加态下运维要能同时看到
 		//「我为什么摘它」和「系统为什么判它坏」，合并成一个字段会互相覆盖。
 		st.ManualReason = e.manualReason
+	}
+	// 仅「生效中」的降权才下发截止（指针 + omitempty）：健康/已过期的降权不下发
+	// 零值时间戳，避免面板与其它消费者把健康号误读成降权中（见 Status.DegradeUntil 注释）。
+	if now.Before(e.degradeUntil) {
+		d := e.degradeUntil
+		st.DegradeUntil = &d
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。口径与 Cooling 判定一致：

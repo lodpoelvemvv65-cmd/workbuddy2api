@@ -68,7 +68,12 @@ type Status struct {
 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
 	ConsecutiveFails int       `json:"consecutive_fails"`
-	DegradeUntil     time.Time `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
+	// DegradeUntil 连败降权截止（非零且未过 = 降权中）。用 *time.Time：time.Time 是
+	// 结构体，omitempty 对它无效，零值会被序列化成 "0001-01-01T00:00:00Z"——健康账号
+	// 也带一个非空 degrade_until，前端按「非空即降权」判断就会把健康号误标成降权中
+	//（本字段的原始 bug）。指针 nil 才能真正被 omitempty 省略，口径与 stateAccount
+	// 的持久化字段一致（那边一直是指针，正是为了同样的省略语义）。
+	DegradeUntil *time.Time `json:"degrade_until,omitempty"`
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`

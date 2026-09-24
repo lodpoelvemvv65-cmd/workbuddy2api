@@ -106,7 +106,7 @@
     <div class="chips" id="poolChips"></div>
     <div class="panel scroll"><table id="accounts">
       <thead><tr>
-        <th>账号</th><th>域</th><th>积分</th><th>状态</th><th>在途</th><th>冷却剩余</th><th>累计成功/失败</th>
+        <th>账号</th><th>域</th><th>积分</th><th>状态</th><th>在途</th><th>冷却剩余</th><th>模型限流</th><th>累计成功/失败</th>
       </tr></thead><tbody></tbody>
     </table></div>
   </section>
@@ -166,6 +166,14 @@ function fago(iso, now) {
   if (s < 5400) return Math.round(s / 60) + "m前";
   if (s < 172800) return (s / 3600).toFixed(1) + "h前";
   return Math.round(s / 86400) + "d前";
+}
+// isFuture 判断 ISO 时间串是否指向未来。
+// 不能用「非空即真」：后端 time.Time 字段即便带 omitempty，零值也可能序列化成
+// "0001-01-01T00:00:00Z"（结构体 omitempty 无效），非空但早已过期。
+function isFuture(iso) {
+  if (!iso) return false;
+  const t = Date.parse(iso);
+  return !isNaN(t) && t > Date.now();
 }
 
 // ── 数据拉取 ────────────────────────────────────────────────────────────
@@ -297,6 +305,22 @@ function renderModels(models, now) {
 }
 
 // ── 账号池 ──────────────────────────────────────────────────────────────
+// renderModelLimits 账号级健康、但个别模型被 6004 独立冷却时的展示（rate_limited_models）。
+// 账号整体仍可选（其它模型照常出号），所以「状态」列仍是健康；限流单独一列，避免
+// 运维看到「健康」却调不到某个模型的困惑。每模型一个 pill，悬停看放行/上游重置时刻。
+function renderModelLimits(list) {
+  if (!list || !list.length) return "-";
+  const now = Date.now();
+  return list.map(m => {
+    const until = m.until ? Date.parse(m.until) : NaN;
+    const remain = isNaN(until) ? 0 : Math.max(0, Math.round((until - now) / 1000));
+    const reset = m.reset_at ? new Date(m.reset_at).toLocaleString("zh-CN", { hour12: false }) : "-";
+    const title = `${m.model}：网关 ${m.until ? new Date(m.until).toLocaleString("zh-CN", { hour12: false }) : "?"} 放行；上游重置 ${reset}` +
+      (m.reason ? `（${m.reason}）` : "");
+    return `<span class="pill warn" title="${esc(title)}">${esc(m.model)} · ${fmtDur(remain)}</span>`;
+  }).join(" ");
+}
+
 function renderStatus(st) {
   const trunc = st.upstream_truncated || {};
   const cn = (st.realm_totals && st.realm_totals.cn) || {};
@@ -315,13 +339,20 @@ function renderStatus(st) {
 
   const accts = (st.accounts || []).slice().sort((a, b) => (b.credits || 0) - (a.credits || 0));
   const tb = document.querySelector("#accounts tbody");
-  if (!accts.length) { tb.innerHTML = '<tr><td colspan="7" class="empty">无账号</td></tr>'; return; }
+  if (!accts.length) { tb.innerHTML = '<tr><td colspan="8" class="empty">无账号</td></tr>'; return; }
   tb.innerHTML = accts.map(a => {
+    // 降权判定按「截止是否在未来」：健康号不应因零值 degrade_until 被误标降权中。
+    const degraded = isFuture(a.degrade_until);
+    // 冷却剩余：软冷却/硬冷却/熔断/降权后端都计入 cool_remaining_sec（cooling=true）。
+    // 降权态同样应显示剩余时间；旧网关未并入 cooling 时用 degrade_until 现算兜底。
+    let remain = a.cool_remaining_sec || 0;
+    if (degraded && !remain) remain = Math.round((Date.parse(a.degrade_until) - Date.now()) / 1000);
+    const remaining = (a.cooling || degraded) ? fmtDur(remain) : "-";
     let state;
     if (a.manual_disabled) state = `<span class="pill muted">手动停用</span>`;
     else if (a.disabled) state = `<span class="pill err" title="${esc(a.disabled_reason || "")}">禁用</span>`;
+    else if (degraded) state = `<span class="pill warn" title="${esc(a.reason || "consecutive failures")}">降权中</span>`;
     else if (a.cooling) state = `<span class="pill warn" title="${esc(a.reason || "")}">冷却·${esc(a.cool_kind || "")}</span>`;
-    else if (a.degrade_until) state = `<span class="pill warn">降权中</span>`;
     else state = `<span class="pill ok">健康</span>`;
     const label = a.nickname ? `${esc(a.nickname)}(${uid8(a.uid)})` : uid8(a.uid);
     return `<tr>
@@ -330,7 +361,8 @@ function renderStatus(st) {
       <td>${num(a.credits)}</td>
       <td>${state}</td>
       <td>${a.in_flight ?? 0}</td>
-      <td>${a.cooling ? fmtDur(a.cool_remaining_sec) : "-"}</td>
+      <td>${remaining}</td>
+      <td>${renderModelLimits(a.rate_limited_models)}</td>
       <td>${num(a.success_count)}/${num(a.err_total)}</td>
     </tr>`;
   }).join("");

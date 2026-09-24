@@ -68,6 +68,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容上游网关**，将 ```CodeB
 - **模型级限流独立冷却** — 6004（该模型使用量超限）只冷却触发调用的模型，切其他模型立即可用；`/status` 透出 `rate_limited_models` 台账
 - **账号临时停用 / 恢复** — 运维可把某个号临时摘出选号池、观察后再放回，不必删凭证（issue #138/#118）。语义是「对话流量摘除」而非「账号冻结」：停用期间签到、token 保活、排程任务照常执行，账号仍在池里、状态照常透出。与系统自动禁用是**两个独立状态位**（`manual_disabled` / `disabled`），各自清除、都清空才回到选号池——避免运维意图被签到解冻等自动复活路径意外解除；停用状态随池状态落盘，重启保留。入口：`/admin/accounts/{uid}/{disable,enable,revive}` 端点 + `cmd/acct` CLI（默认关闭，`admin.enabled` 显式开启）
 - **状态持久化** — 池状态（积分 / 冷却 / 熔断 / 计数）本地原子落盘 `state.json`，可选镜像至 Upstash Redis，重启后择优恢复
+- **请求统计持久化** — `/v1/stats`（请求数 / 缓存命中率 / 速度 / 扣费）默认落盘 `state.json` 同目录的 `metrics.json`（`metrics_persist` 默认 true，`metrics_file` 可显式指定路径），容器 / 进程重启后累计量与统计窗口延续，不再从零重新计数；`metrics_persist: false` 回到纯内存旧行为
 
 ### 请求链路
 
@@ -203,6 +204,19 @@ mkdir -p ./logs && chown -R 10001:10001 ./logs   # app(uid 10001) 需写权限
 - 打开失败只降级为仅 stderr（打一条 WARN），**不会**因日志权限问题拒绝启动。
 - `log_file` 缺省为空 = 关闭（零回归）。`docker-compose.yml` 已挂载 `./logs:/app/logs`。
 
+#### 请求统计持久化（`/v1/stats` 重启不清零）
+
+面板「模型统计」卡片的数据源 `/v1/stats` 默认**落盘**，容器 / 进程重启后累计量（请求 / token / 缓存命中 / 扣费）与统计窗口 `since` 延续，不必从零重新计数。落盘路径与 `state.json` / `model.json` 同目录（默认 `./data/metrics.json`，Docker 已挂载 `./data`），无需额外配置。
+
+```json
+"metrics_persist": true,        // 默认 true；false = 纯内存旧行为（重启清零）
+"metrics_file": ""              // 空 = 派生 state_file 同目录 metrics.json；非空显式指定
+```
+
+- 后台每 5s 检查脏标记原子落盘（tmp + rename），与池的 `state.json` 同范式；`POST /v1/stats/reset` 会同步清空并立即落盘。
+- `metrics.json` 缺失 / 损坏 / 含负计数字段时静默零状态或剔除破损条目，不拒绝启动。
+- 文件权限：与 `./data` 同口径（`chown -R 10001:10001 ./data`）。落盘失败只打节流 WARN，不影响请求。
+
 ### 源码构建
 
 ```bash
@@ -294,7 +308,7 @@ go run ./cmd/dashboard -listen :9000 -gateway http://127.0.0.1:7863
 
 然后浏览器打开 `http://127.0.0.1:7864/`。数据来源：
 
-- `GET /v1/stats` — 按模型的请求 / 缓存 / 速度 / 扣费聚合（已有）；
+- `GET /v1/stats` — 按模型的请求 / 缓存 / 速度 / 扣费聚合（已有；默认落盘 `./data/metrics.json`，重启延续，见「请求统计持久化」）；
 - `GET /status` — 账号池状态（已有）；
 - `GET /v1/logs?limit=N` — **最近请求流水**（本仓库新增端点）：网关内一份**有界内存
   环形缓冲**（最近 1000 条，进程重启清零），字段与请求表格日志同构。它不依赖日志文件，

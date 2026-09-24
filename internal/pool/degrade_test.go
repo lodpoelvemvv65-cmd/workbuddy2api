@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,36 @@ func (p *Pool) consecutiveStateOf(uid string) (fails int, degradeUntil time.Time
 		return 0, time.Time{}, false
 	}
 	return e.consecutiveFails, e.degradeUntil, true
+}
+
+// TestStatusOmitsInactiveDegradeUntil 健康/已过期的降权不下发 degrade_until。
+// 原 bug：Status.DegradeUntil 是非指针 time.Time，omitempty 对结构体无效，零值恒被
+// 序列化成 "0001-01-01T00:00:00Z"；面板按「非空即降权」判断，把健康号误标成降权中。
+func TestStatusOmitsInactiveDegradeUntil(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	st, _ := p.Status("u1")
+	if st.DegradeUntil != nil {
+		t.Fatalf("健康账号不应带 degrade_until, got %v", st.DegradeUntil)
+	}
+	raw, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "degrade_until") {
+		t.Fatalf("健康账号 JSON 不应出现 degrade_until: %s", raw)
+	}
+
+	// 降权生效 → 非 nil；到期 → 重新省略（entry 里字段未清也不算生效）。
+	p.SetDegrade(1, 40*time.Millisecond, 2*time.Hour)
+	p.NoteFailures("u1")
+	if st, _ = p.Status("u1"); st.DegradeUntil == nil {
+		t.Fatal("降权期应透出 degrade_until")
+	}
+	time.Sleep(60 * time.Millisecond)
+	if st, _ = p.Status("u1"); st.DegradeUntil != nil {
+		t.Fatalf("降权到期后不应再下发 degrade_until, got %v", st.DegradeUntil)
+	}
 }
 
 // TestNoteFailuresTriggersDegradeAtThreshold 达阈触发降权（核心验收点）：
@@ -57,7 +88,7 @@ func TestNoteFailuresTriggersDegradeAtThreshold(t *testing.T) {
 	if st.Cooling != true || st.Reason != degradeReason || st.CoolKind != "degrade" {
 		t.Fatalf("降权期 Status 应呈非健康+连败文案: cooling=%v reason=%q kind=%q", st.Cooling, st.Reason, st.CoolKind)
 	}
-	if st.ConsecutiveFails != 0 || st.DegradeUntil.IsZero() {
+	if st.ConsecutiveFails != 0 || st.DegradeUntil == nil || st.DegradeUntil.IsZero() {
 		t.Fatalf("Status 应透出降权态: fails=%d until=%v", st.ConsecutiveFails, st.DegradeUntil)
 	}
 }

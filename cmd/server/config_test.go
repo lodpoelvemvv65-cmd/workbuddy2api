@@ -45,6 +45,47 @@ func TestEnvOverride(t *testing.T) {
 	}
 }
 
+// TestMetricsPersistConfig 请求统计持久化默认开启；显式 false 关闭；env 可覆盖。
+func TestMetricsPersistConfig(t *testing.T) {
+	// 默认：开启，路径留空由 main 派生 state_file 同目录 metrics.json。
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.MetricsPersist {
+		t.Errorf("metrics_persist 默认应为 true")
+	}
+	if c.MetricsFile != "" {
+		t.Errorf("metrics_file 默认应为空（派生），得到 %q", c.MetricsFile)
+	}
+
+	// 显式关闭。
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"metrics_persist":false,"metrics_file":"./data/m.json"}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.MetricsPersist {
+		t.Errorf("metrics_persist=false 应关闭持久化")
+	}
+	if c.MetricsFile != "./data/m.json" {
+		t.Errorf("metrics_file=%q want ./data/m.json", c.MetricsFile)
+	}
+
+	// env 覆盖。
+	t.Setenv("WB2A_METRICS_FILE", "/tmp/env-metrics.json")
+	t.Setenv("WB2A_METRICS_PERSIST", "true")
+	c, err = Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.MetricsPersist || c.MetricsFile != "/tmp/env-metrics.json" {
+		t.Errorf("env 覆盖失败: persist=%v file=%q", c.MetricsPersist, c.MetricsFile)
+	}
+}
+
 func TestBadDuration(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
