@@ -1023,6 +1023,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 响应头透出实际服务的账号：上游选号对客户端原本完全不可见——管理面板
+		// 的网关据此把每次成功请求记到账号名下（按账号的消耗统计），排障时也能
+		// 看到「这次是谁在答」。uid 是十六进制 ASCII，可直接进响应头；昵称可能
+		// 含非 ASCII，不入头（消费方按 uid 自行映射）。放在 NoteSuccess 之后：
+		// 头的语义是「这个号成功服务了本次请求」——中途失败换号的账号不冒领。
+		// 此时尚未写任何字节，流式（首帧前）与非流式（writeJSON 前）都生效。
+		w.Header().Set("X-Wb-Account", acct.UID)
 		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)

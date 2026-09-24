@@ -1,6 +1,13 @@
 services:
   wb2api:
-    build: .
+    build:
+      context: .
+      args:
+        # 可选：Go 模块代理。官方 proxy.golang.org 在中国大陆不可达 —— 构建第一步
+        # 就是 `go mod download`，会长时间卡在这一层（看着像构建挂了），有时直接失败。
+        # 国内构建填 https://goproxy.cn,direct（或 https://mirrors.aliyun.com/goproxy/）。
+        # 留空 = 官方默认，行为与上游原版一致。
+        GOPROXY: ""
     container_name: workbuddy2api
     restart: unless-stopped
     environment:

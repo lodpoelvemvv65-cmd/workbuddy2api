@@ -5,6 +5,11 @@ FROM golang:1.26-alpine AS build
 ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY}
 WORKDIR /src
+# 可选：Go 模块代理。官方 proxy.golang.org 在中国大陆不可达（go mod download
+# 会卡死）；国内机器构建时传 --build-arg GOPROXY=https://goproxy.cn,direct。
+# 留空 = 官方默认，行为与上游原版一致。
+ARG GOPROXY=""
+RUN test -z "${GOPROXY}" || go env -w GOPROXY="${GOPROXY}"
 COPY go.mod ./
 RUN go mod download
 COPY . .
