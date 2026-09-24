@@ -180,7 +180,37 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	setCORS(w, r)
+	// 跨源预检（CORS preflight）统一在这里应答：Go 1.22 mux 对未注册的方法
+	// （OPTIONS）会回 405，浏览器据此判定预检失败，直连网关的网页端只能报
+	// "无法连接模型服务"。对所有路径回 204 + CORS 头，浏览器才放行真正的请求。
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// setCORS 给所有响应补宽松 CORS 头，让浏览器可从任意源直连网关。
+//
+// 为什么可以放心用 `*`：本网关的鉴权是**请求头里的 api_key**（Authorization /
+// X-Api-Key），不是 cookie，浏览器不会自动携带；因此 `*` 不产生凭证型 CSRF，
+// 未带 key 的跨源请求照样 401。也正因不用 cookie，无需（也不应）回
+// Access-Control-Allow-Credentials。
+func setCORS(w http.ResponseWriter, r *http.Request) {
+	h := w.Header()
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	// 预检请求会声明它实际要用到的头；回显最省事也最不容易漏——各家客户端差异大
+	// （Authorization / X-Api-Key / anthropic-version / x-stainless-* 等）。
+	if req := r.Header.Get("Access-Control-Request-Headers"); req != "" {
+		h.Set("Access-Control-Allow-Headers", req)
+	} else {
+		h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Accept")
+	}
+	h.Set("Access-Control-Max-Age", "86400")
+	// 让浏览器能读到自定义响应头（如 X-Service）。
+	h.Set("Access-Control-Expose-Headers", "*")
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
