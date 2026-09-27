@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/taskledger"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -29,6 +31,10 @@ type Config struct {
 	KeepaliveHours []int // 默认 [22]
 	SchoolHours    []int // 默认 [12]：开学季任务（迁移自系统 crontab）
 	CatHours       []int // 默认 [1]：夜猫子任务（迁移自系统 crontab）
+	// JitterMinutes 触发时刻抖动窗口（分钟）：每类任务的触发时刻在该窗口内取一个
+	// **确定性**偏移，把「所有部署都在整点同一秒打上游」摊开，对 WAF 友好。
+	// 0/缺省 = 不加偏移（精确整点，与引入前逐字一致）。
+	JitterMinutes int
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
@@ -51,6 +57,17 @@ type Config struct {
 	SchoolDisabled bool
 	// CatDisabled 显式关闭夜猫子任务排程（schedule.cat_enabled=false）。
 	CatDisabled bool
+
+	// RetryDelayMinutes 当日失败重试延迟（分钟）。**0 = 关闭**（缺省，行为与引入前
+	// 逐字一致）。>0 时，某类任务一轮「全灭」后在该延迟后再跑一次（判据见
+	// recordRun 的 AllFailed 注释），当日最多 RetryMaxPerDay 次。
+	RetryDelayMinutes int
+	// RetryMaxPerDay 每类任务每日最多重试次数。仅 RetryDelayMinutes>0 时生效；
+	// <=0 与关闭等价（由 taskledger.PlanRetry 判为 disabled）。
+	RetryMaxPerDay int
+	// LedgerFile 任务执行台账落盘路径。空 = 纯内存（重启后只剩新跑过的记录）。
+	// 台账是观测数据，落盘失败只记日志、不影响任务执行，故不做启动期 fail-fast。
+	LedgerFile string
 }
 
 // Scheduler 调度器。
@@ -70,7 +87,18 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// ledger 任务执行台账 + 当日失败重试状态（ledger.go）。恒非 nil（New 构造）；
+	// 仅当直接手搓 &Scheduler{}（测试）时才为 nil——此时记台账与重试都是空操作。
+	// 与 Handler.budget 的直通语义同口径：观测组件缺席不该让任务本身 panic
+	// （调度 goroutine 里 panic 会带走整个进程）。
+	ledger *taskledger.Store
 }
+
+// Ledger 返回任务执行台账（只读视图），供 server 的 /status 与 /metrics 渲染。
+// 返回窄接口能拿到的具体类型：*taskledger.Store 结构上即满足 server 侧的
+// TaskLedgerReader，无需为接线改动本包。
+func (s *Scheduler) Ledger() *taskledger.Store { return s.ledger }
 
 // New 构建。
 func New(cfg Config) *Scheduler {
@@ -96,7 +124,12 @@ func New(cfg Config) *Scheduler {
 	if cfg.ActivityReportCount <= 0 {
 		cfg.ActivityReportCount = 1
 	}
-	return &Scheduler{cfg: cfg, adoptTried: make(map[string]string), rewardClaimed: make(map[string]string)}
+	return &Scheduler{
+		cfg:           cfg,
+		adoptTried:    make(map[string]string),
+		rewardClaimed: make(map[string]string),
+		ledger:        taskledger.New(cfg.LedgerFile),
+	}
 }
 
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
@@ -125,16 +158,52 @@ type CheckinOutcome struct {
 // ErrBusy 已有一次签到正在执行（手动入口与定时撞车）。
 var ErrBusy = errors.New("checkin already running")
 
-// nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
-func nextFire(now time.Time, hours []int) time.Time {
+// jitterOffset 返回「任务类 + 名义时点」的**确定性**偏移，落在 [0, jitterMinutes) 分钟。
+//
+// 为什么必须确定性（而不是每次现摇一个随机数）：
+// Run 主循环每一轮都重新调用 nextWake。若偏移每次不同，某个槽位触发完再重算时，
+// 新摇出的偏移仍可能落在"现在之后"——于是同一个小时被反复派发，任务重复执行。
+// 用「任务名 | 日期 | 小时」派生后，同一槽位每次算出的偏移完全一致：触发过的时点
+// 不再 After(now)，自然顺延到次日。这同时也是可测的前提。
+//
+// 散列用 FNV-1a：标准库自带、无状态、不引 math/rand 全局种子（那会让结果依赖调用
+// 顺序）。语义与 internal/server 的 jitterDur（±25% 时长缩放、随机）不同，故不复用。
+func jitterOffset(kind taskKind, nominal time.Time, jitterMinutes int) time.Duration {
+	if jitterMinutes <= 0 {
+		return 0 // 0/负数 = 不加偏移（旧行为）
+	}
+	span := time.Duration(jitterMinutes) * time.Minute
+	secs := int64(span / time.Second)
+	if secs <= 0 {
+		return 0
+	}
+	h := fnv.New32a()
+	// 名义时点用「日期 + 小时」参与散列：同一天同一小时的偏移固定，换一天则变。
+	_, _ = fmt.Fprintf(h, "%s|%s", kind, nominal.Format("2006-01-02T15"))
+	return time.Duration(int64(h.Sum32())%secs) * time.Second
+}
+
+// nextFire 返回 now 之后最近的一个触发时刻；hours 为本地小时（0-23）。
+//
+// jitterMinutes > 0 时给每个候选时点加上 jitterOffset 的确定性偏移（按 kind 与
+// 名义时点派生），用于把整点齐发的负载摊开。偏移只在**定下日期之后**施加：先算
+// 今天的名义时点、加偏移、若已过则改用明天的名义时点重新算偏移——否则跨日时
+// 偏移会串到错误的日期上。
+func nextFire(now time.Time, hours []int, kind taskKind, jitterMinutes int) time.Time {
 	var earliest time.Time
 	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-		if !t.After(now) {
-			t = t.Add(24 * time.Hour)
-		}
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
+		// 先试今天，过了再试明天（最多两天足够：明天同一小时必然在 now 之后）。
+		for d := 0; d < 2; d++ {
+			nominal := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location()).
+				AddDate(0, 0, d)
+			t := nominal.Add(jitterOffset(kind, nominal, jitterMinutes))
+			if !t.After(now) {
+				continue
+			}
+			if earliest.IsZero() || t.Before(earliest) {
+				earliest = t
+			}
+			break
 		}
 	}
 	return earliest
@@ -152,6 +221,26 @@ const (
 	taskCat
 )
 
+// String 返回任务类的稳定名字，用作抖动散列的种子（不要用 iota 数值：数值会随
+// 枚举顺序调整而变，名字不会，且日志里可读）。
+func (k taskKind) String() string {
+	switch k {
+	case taskCheckin:
+		return "checkin"
+	case taskTravel:
+		return "travel"
+	case taskActivity:
+		return "activity"
+	case taskKeepalive:
+		return "keepalive"
+	case taskSchool:
+		return "school"
+	case taskCat:
+		return "cat"
+	}
+	return "unknown"
+}
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
@@ -161,23 +250,38 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 		kind taskKind
 	}
 	var slots []slot
+	jit := s.cfg.JitterMinutes
 	if !s.cfg.CheckinDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours), taskCheckin})
+		slots = append(slots, slot{nextFire(now, s.cfg.CheckinHours, taskCheckin, jit), taskCheckin})
 	}
 	if !s.cfg.TravelDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours), taskTravel})
+		slots = append(slots, slot{nextFire(now, s.cfg.TravelHours, taskTravel, jit), taskTravel})
 	}
 	if !s.cfg.ActivityDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours), taskActivity})
+		slots = append(slots, slot{nextFire(now, s.cfg.ActivityHours, taskActivity, jit), taskActivity})
 	}
 	if !s.cfg.KeepaliveDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours), taskKeepalive})
+		slots = append(slots, slot{nextFire(now, s.cfg.KeepaliveHours, taskKeepalive, jit), taskKeepalive})
 	}
 	if !s.cfg.SchoolDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours), taskSchool})
+		slots = append(slots, slot{nextFire(now, s.cfg.SchoolHours, taskSchool, jit), taskSchool})
 	}
 	if !s.cfg.CatDisabled {
-		slots = append(slots, slot{nextFire(now, s.cfg.CatHours), taskCat})
+		slots = append(slots, slot{nextFire(now, s.cfg.CatHours, taskCat, jit), taskCat})
+	}
+	// 当日失败重试：**所有已排期的重试**（含尚未到点的）都参与「下一个唤醒时刻」
+	// 的竞争——只算到点的会让未到点的重试失去唤醒源，主循环会一路睡到下一个正常
+	// 时点，那次重试要么迟到、要么与正常轮次撞在一起。计划时刻可能已过（进程忙、
+	// 刚启动），此时 earliest 落在过去 → Run 的 timer 立即到期，等价于「立刻补跑」。
+	// 已禁用的任务不参与（用户关掉了它，不该被一次重试悄悄拉起来）。
+	if s.ledger != nil {
+		for name, at := range s.ledger.ArmedRetries(now) {
+			k, ok := kindByName(name)
+			if !ok || s.kindDisabled(k) {
+				continue
+			}
+			slots = append(slots, slot{at, k})
+		}
 	}
 	var earliest time.Time
 	for _, sl := range slots {
@@ -191,11 +295,17 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	if earliest.IsZero() {
 		return time.Time{}, nil
 	}
+	// 去重：同一类任务可能同时出现在普通槽位与已排期的重试里（两者时刻碰巧相等，
+	// 例如重试恰好排在某个正常整点上），不去重会让 runBatch 对同一任务并行派发
+	// 两次——同一批账号被同时打两遍。
 	var kinds []taskKind
+	seen := make(map[taskKind]bool, len(slots))
 	for _, sl := range slots {
-		if !sl.at.IsZero() && sl.at.Equal(earliest) {
-			kinds = append(kinds, sl.kind)
+		if sl.at.IsZero() || !sl.at.Equal(earliest) || seen[sl.kind] {
+			continue
 		}
+		seen[sl.kind] = true
+		kinds = append(kinds, sl.kind)
 	}
 	return earliest, kinds
 }
@@ -271,28 +381,62 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 // dispatch 按任务类型分发到对应执行函数。脚本类（school/cat）失败只记 WARN、
 // 不影响其余任务继续执行（与现有各任务"单账号失败不阻断遍历"同口径）。
 // ctx 传导给带账号间限速的遍历（取消时立即放弃剩余账号），纯脚本类任务不感知。
+//
+// 本轮若是某个已到点的当日失败重试，先把触发来源判成 retry 并消费掉该重试；
+// 否则就是正常排程轮次（ledger.go 的 takeRetryTrigger，判据与 nextWake 同源）。
 func (s *Scheduler) dispatch(ctx context.Context, k taskKind) {
+	trigger := triggerSchedule
+	if s.takeRetryTrigger(k, time.Now()) {
+		trigger = triggerRetry
+	}
 	switch k {
 	case taskCheckin:
-		s.RunCheckinNow()
+		s.runCheckin(trigger)
 	case taskTravel:
-		s.runTravel(ctx)
+		s.runTravel(ctx, trigger)
 	case taskActivity:
-		s.runActivity(ctx)
+		s.runActivity(ctx, trigger)
 	case taskKeepalive:
-		s.RunKeepaliveNow()
+		s.runKeepalive(trigger)
 	case taskSchool:
-		s.RunSchoolNow()
+		s.runSchool(trigger)
 	case taskCat:
-		s.RunCatNow()
+		s.runCat(trigger)
 	}
 }
 
-// RunCheckinNow 定时触发的立即签到：逐账号结果由 CheckinAll 记日志，此处只兜住"撞车跳过"。
-func (s *Scheduler) RunCheckinNow() {
-	if _, err := s.CheckinAll(); err != nil {
+// RunCheckinNow 立即签到的人工入口（/admin/tasks/checkin/run、一次性工具、测试）。
+// 与定时轮次的差别只在台账的 trigger 标记：人工触发的失败不排当日重试
+// （见 recordRun 的注释）。
+func (s *Scheduler) RunCheckinNow() { s.runCheckin(triggerManual) }
+
+// runCheckin 执行一轮全量签到并记台账。
+//
+// 计数直接来自 CheckinAll 的逐账号结果（不另做推断）：ErrBusy（撞车）时
+// out 为空 → total=0、fail=0 → 不判全灭、不排重试，这是对的——「与另一次签到
+// 撞车」不是失败。
+func (s *Scheduler) runCheckin(trigger string) ([]CheckinOutcome, error) {
+	started := time.Now()
+	out, err := s.CheckinAll()
+	if err != nil {
 		log.Printf("scheduled checkin skipped: %v", err)
 	}
+	var t runTally
+	t.total = len(out)
+	for _, oc := range out {
+		switch oc.Status {
+		case CheckinOK:
+			t.ok++
+		case CheckinAlready:
+			t.already++
+		case CheckinSkipped:
+			t.skipped++
+		case CheckinFail:
+			t.fail++
+		}
+	}
+	s.recordRun(taskCheckin, trigger, started, t)
+	return out, err
 }
 
 // CheckinAll 全量签到：按需刷新 token → daily-checkin → 查余额 → 解冻冷却账号。
@@ -411,39 +555,33 @@ func joinDetail(existing, add string) string {
 	return existing + "; " + add
 }
 
-// RunActivityNow 立即对池内所有可用账号执行对话活跃上报。
-// 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
-// CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 可用）；单账号失败
-// 只记 WARN 不影响遍历。
-//
-// 每号上报 N 条（ActivityReportCount，默认 5）：N 条共用同一 conversationId
-// （wb2api-<ms>），模拟同一会话内 N 轮对话——这是领养猫（buddy/first）对话量
-// 门槛的实测刷法（chat_5 前置需 5 次对话）。requestId 各条独立（同会话多轮）。
-// 账号内 N 条之间间隔 activityReportGap（1.5s）避免秒发触发风控。
-//
-// 0/缺省 ActivityReportCount = 1 条，兼容旧行为（仅点亮连登 + 解锁 first_buddy）。
-//
-// 上报成功后：① streak 自检（回读连登，发现「200 但静默丢弃」）；
-// ② 无猫账号立即重试领养（travelAdoptForce）——对话量刚补满的新状态，不算重试，
-// 豁免 adoptTriedToday 当日防抖（旅行排程 09 点已领养过且 skip，10 点上报补满后
-// 不能依赖下一轮旅行领养，就地闭环）。
 // RunActivityNow 立即对池内所有可用账号执行对话活跃上报（无 ctx 的外部入口：
 // cmd/activity 一次性触发、测试）。内部走 runActivity，取背景 ctx（不可取消，
 // 语义与引入前 time.Sleep 版一致）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	s.runActivity(context.Background(), triggerManual)
 }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+//
+// 计数口径（写台账用）：Total 为参与遍历的账号数；一个号把 N 条全发满记 OK，
+// 中途报错记 Fail；禁用号与无 AccessToken 的号记 Skipped。
+// 被 ctx 取消打断时把本轮标为 interrupted —— 此时计数是部分的，不判全灭。
+func (s *Scheduler) runActivity(ctx context.Context, trigger string) {
+	started := time.Now()
+	var t runTally
+	defer func() { s.recordRun(taskActivity, trigger, started, t) }()
+
 	count := s.cfg.ActivityReportCount
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			t.skipped++
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			t.skipped++
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -451,10 +589,12 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 单账号失败只记 WARN 不影响遍历（下方 report err → break 该号 → continue 下号）。
 		if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {
+				t.interrupted = true
 				return // 优雅停机：不等限速睡满，剩余账号下轮再报
 			}
 		}
 		first = false
+		t.total++
 		// N 条共用同一 conversationId（同会话），requestId 各自独立（每条一个）。
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		ok := 0
@@ -469,13 +609,16 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 			if i < count {
 				// 账号内 5 条之间间隔，避免秒发风控；取消时立即放弃本号剩余条数。
 				if !sleepCtx(ctx, activityReportGap) {
+					t.interrupted = true
 					return
 				}
 			}
 		}
 		if ok < count {
+			t.fail++
 			continue // N 条未发满：streak 自检与领养均无意义，下个账号
 		}
+		t.ok++
 		s.checkActivityStreak(a) // N 条全发满 → 回读 streak 自检（只留结论行）
 		s.travelAdoptForce(a)    // 无猫账号对话量刚补满 → 立即重试领养（豁免防抖）
 		s.claimGrowthRewards(a)  // 连登奖励 + 抽奖：点亮连登后按天领取（finally 语义：失败不拖累上报）
@@ -670,20 +813,32 @@ func (s *Scheduler) markRewardClaimed(uid string) {
 	s.rewardClaimed[uid] = travelDay(time.Now())
 }
 
-// RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
+// RunKeepaliveNow 立即对所有账号刷新 token 的人工入口（/admin/tasks/keepalive/run、测试）。
+func (s *Scheduler) RunKeepaliveNow() { s.runKeepalive(triggerManual) }
+
+// runKeepalive 对所有账号刷新 token；session 死亡的自动禁用。
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
-func (s *Scheduler) RunKeepaliveNow() {
+//
+// 计数口径：刷新成功记 OK，刷新报错记 Fail（含 12153）；禁用号与无 refresh token
+// 的号记 Skipped。落盘失败不计 Fail——token 已经刷到手，重试救不了磁盘。
+func (s *Scheduler) runKeepalive(trigger string) {
+	started := time.Now()
+	var t runTally
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			t.skipped++
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshTokenValue() == "" {
+			t.skipped++
 			continue
 		}
+		t.total++
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+			t.fail++
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -693,10 +848,12 @@ func (s *Scheduler) RunKeepaliveNow() {
 			}
 			continue
 		}
+		t.ok++
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
+	s.recordRun(taskKeepalive, trigger, started, t)
 }

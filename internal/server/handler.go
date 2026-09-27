@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -83,6 +84,36 @@ type Config struct {
 	// 做 io.ReadAll），请求路径上凭空多一个后台 goroutine 会让测试变成随机失败。
 	// 真要不踩坑就得让测试逐个显式关闭，不如让生产显式打开。
 	ColdCatalogWarm bool
+	// MetricsEnabled Prometheus 指标端点开关（config metrics.enabled，默认 false）。
+	// 关闭时 /metrics 不注册（同 AdminEnabled 的条件注册理由：不向未鉴权探测暴露
+	// "这里有个指标面"）。开启后走 withAuth，与 /status、/v1/stats 同鉴权口径。
+	MetricsEnabled bool
+
+	// Tasks 手动触发排程任务的实现（admin_tasks.go）。nil = 未接线，此时
+	// /admin/tasks/* 回 503（不静默 404——"配置开了但没接线"要让运维看见）。
+	// 复用 admin.enabled 开关，不单开配置键：它只是账号管理端点的一个动作。
+	Tasks TaskRunner
+
+	// Audit 管理操作审计接收器（admin_audit.go）。nil = 不审计。
+	//
+	// 与 AdminEnabled 拆成两个开关：审计是「额外落一份磁盘文件」，老部署开了
+	// admin 也不该被动多出一个文件，故 config admin.audit_enabled 缺省关闭。
+	// 由 main 在启动期构造（NewAuditLog 会做可写性预检并 fail-fast）。
+	Audit *AuditLog
+
+	// BudgetLimit 当日累计 credit 上限（config budget.daily_credit_limit）。
+	// <=0 = 关闭该闸（不限），行为与引入前逐字一致。计数按 CST 自然日重置、
+	// 进程内不落盘（见 budget.go）。
+	BudgetLimit float64
+
+	// TaskLedger 任务执行台账的只读视图（/status 的 task_ledger 段 + /metrics 的
+	// 任务指标）。nil = 未接线，此时两处都不含任务维度——与 Pool/Upstream 的
+	// 接线风格一致，测试可注入假台账。
+	//
+	// 用窄接口而非直接依赖 internal/scheduler：server 包不反向 import scheduler
+	// （理由见 admin_tasks.go 的 TaskRunner 注释）。台账的数据结构与存储放在
+	// internal/taskledger，两个包都只依赖它，不产生环。
+	TaskLedger TaskLedgerReader
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -121,6 +152,16 @@ type Handler struct {
 	// 避免目录长期拉不到时每个请求都起一个 goroutine 去撞上游（上游目录自身另有
 	// 5min 负缓存兜底，这里只挡并发风暴）。
 	warmBusy atomic.Bool
+	// taskMu/taskRunning 手动任务触发的防重入闸（admin_tasks.go）：任务名 →
+	// 是否已有一次手动触发在跑。只挡「手动 vs 手动」连点；「手动 vs 定时」撞车
+	// 由 scheduler 自己的 checkinMu 兜。进程内状态、重启清零——重启后没有在跑的
+	// 手动任务，清零即正确，无需持久化。
+	taskMu      sync.Mutex
+	taskRunning map[string]bool
+
+	// budget 当日积分预算闸（budget.go）。恒非 nil（NewHandler 构造）；
+	// 仅当直接手搓 &Handler{} 时才为 nil，此时 admit/add 都是直通。
+	budget *dailyBudget
 }
 
 // NewHandler 构建 handler。
@@ -153,7 +194,12 @@ func NewHandler(cfg Config) *Handler {
 		}
 		cfg.ModelAliases = norm
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		taskRunning: map[string]bool{},
+		budget:      newDailyBudget(cfg.BudgetLimit),
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	// Anthropic Messages 兼容层（Claude Code / 官方 Anthropic SDK 直连）。
 	// 见 anthropic.go 文件头：协议垫片复用 chatCompletions 的整条上游管线。
@@ -175,9 +221,25 @@ func NewHandler(cfg Config) *Handler {
 	// 区分——路由一旦注册，"带 key 得 401 / GET 得 405 / JSON 信封 404" 三者都会
 	// 暴露管理面存在。
 	if cfg.AdminEnabled {
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable", h.withAuth(h.adminAccountDisable))
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable", h.withAuth(h.adminAccountEnable))
-		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive", h.withAuth(h.adminAccountRevive))
+		// 四条路由都包一层审计（config admin.audit_enabled，缺省关闭时 audit 是
+		// 直通、零开销）。审计在 withAuth **之内**：未通过鉴权的探测不落盘，
+		// 免得给匿名方一个「写运维磁盘」的口子（见 admin_audit.go 的 audit 注释）。
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/disable",
+			h.withAuth(h.audit("account.disable", auditPathValue("uid"), h.adminAccountDisable)))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/enable",
+			h.withAuth(h.audit("account.enable", auditPathValue("uid"), h.adminAccountEnable)))
+		h.mux.HandleFunc("POST /admin/accounts/{uid}/revive",
+			h.withAuth(h.audit("account.revive", auditPathValue("uid"), h.adminAccountRevive)))
+		// 手动触发排程任务（admin_tasks.go）：错过整点窗口时人工补跑一次，
+		// 不必等下一个整点。异步受理（202），同一任务在跑时回 409。
+		h.mux.HandleFunc("POST /admin/tasks/{name}/run",
+			h.withAuth(h.audit("task.run", auditPathValue("name"), h.adminTaskRun)))
+	}
+	// Prometheus 指标端点（默认关闭，config metrics.enabled 开启后生效）。
+	// 与 admin 同用条件注册：未开启时路径不存在，未鉴权探测无法区分它与真 404。
+	// 数据源全是进程内只读快照，scrape 不触发任何上游请求。
+	if cfg.MetricsEnabled {
+		h.mux.HandleFunc("GET /metrics", h.withAuth(h.promMetrics))
 	}
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	return h
@@ -299,9 +361,13 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// (域, 模型) 的最近探索时刻（键 "realm|model"）。与 accounts[].model_costs
 	// 行对照即可读出「探索→毕业」全链路（单一事实来源，不做双表示）。零回归只增键。
 	exploreEvents, exploreLast := h.cfg.Pool.CostExploreStatus()
+	// daily_budget 当日积分预算台账（budget.go）：已用 / 上限 / 当日被拒次数。
+	// 上限为 0 表示闸关闭（不限），此时 used 仍照常累计——运维可以先用观察模式
+	// 跑几天、看真实日耗再决定阈值，不必先开闸才知道该设多少。
+	budgetUsed, budgetLimit, budgetRejected := h.budget.snapshot()
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"accounts":       h.cfg.Pool.List(),
 		"total":          total,
 		"healthy":        healthy,
@@ -323,7 +389,20 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 			"events_total": exploreEvents,
 			"per_model":    exploreLast,
 		},
-	})
+		// daily_budget 按 CST 自然日重置，进程重启清零（见 budget.go）。
+		"daily_budget": map[string]any{
+			"used":     budgetUsed,
+			"limit":    budgetLimit,
+			"rejected": budgetRejected,
+			"day":      cstDay(time.Now()),
+		},
+	}
+	// task_ledger 六类任务「最近一轮」的结果 + 当日失败重试状态（task_ledger.go）。
+	// 未接线时不写该键（而非写 null）：老部署与测试的响应体形状保持不变。
+	if tl := h.taskLedgerStatus(); tl != nil {
+		body["task_ledger"] = tl
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // countsMapFrom 把 CountsDetailed 五元组编码为 /status realm_totals 的字段对象。
@@ -699,6 +778,16 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// 当日积分预算闸（config budget.daily_credit_limit，缺省 0 = 关闭）。
+	// 位置在**读 body 之前**：被拒的请求不该先把几十 MB 请求体读进内存再丢掉。
+	// 429 是 OpenAI 对「配额耗尽」的既有语义（客户端会退避重试），code 取自定义值
+	// 以便与账号级限流（上游 429 转出的 soft_rate 路径）区分开。
+	if !h.budget.admit() {
+		used, limit, _ := h.budget.snapshot()
+		writeOpenAIError(w, http.StatusTooManyRequests, "daily_budget_exceeded",
+			fmt.Sprintf("daily credit budget exhausted (used %.2f of %.2f, resets at 00:00 CST)", used, limit))
+		return
+	}
 	// 请求体无大小上限（max_body_mb 已移除）：完整读入，超限类问题交由上游自然返回
 	// 错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断防御语义保留在
 	// 读错误路径——移除预拦截后，截断只可能来自客户端自己断流，读 body 出错就地 400，
@@ -741,7 +830,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	realm, bareModel := resolveModel(peek.Model)
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
+	st := newChatStat(time.Now(), body, peek.Stream, h.budget)
 	// 客户端来源（面板「来源」列）：只读请求头 + 协议路径推断，纯展示用途。
 	// 在 r.Clone 之后调用同样成立——Clone 保留全部头与 URL。
 	st.source = detectClientSource(r.Header, r.URL.Path)

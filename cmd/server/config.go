@@ -4,6 +4,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -54,7 +55,65 @@ type Config struct {
 	// （withAuth + 同一个 api_key，不另立管理密钥）。
 	Admin struct {
 		Enabled bool `json:"enabled"` // 默认 false
+		// AuditEnabled 管理操作审计日志开关。默认**关闭**：审计会在磁盘上额外
+		// 落一份文件，老部署即便开了 admin 也不该被动产生新文件，故与 enabled
+		// 拆成两个开关。开启后 /admin 下每个动作（账号 disable/enable/revive、
+		// 手动触发任务）追加一行 JSONL，含时间/动作/对象/结果/来源 IP 与
+		// api_key 指纹（指纹而非原文）。
+		// 要求 admin.enabled 同时开启——审计的对象就是这些端点，端点不存在时
+		// 开着审计是个只会误导人的空配置，normalize 直接拒绝。
+		AuditEnabled bool `json:"audit_enabled"` // 默认 false
+		// AuditFile 审计日志路径。空 = 内置默认 ./data/admin_audit.log。
+		// 与 state_file 同约定：父目录由进程自建（NewAuditLog 会 MkdirAll）。
+		AuditFile string `json:"audit_file"`
 	} `json:"admin"`
+
+	// Metrics Prometheus 指标端点开关。默认**关闭**：开启后 GET /metrics 暴露
+	// 进程内只读快照（账号池健康度 + 按模型的请求/延迟/token/积分），供 Prometheus
+	// 抓取与 Grafana 看板。与 /status、/v1/stats 同走 withAuth（同一个 api_key，
+	// 不另立指标密钥）；抓取端用 authorization/bearer_token 配置即可。
+	// 数据源全是进程内状态，scrape 不产生任何上游请求。
+	Metrics struct {
+		Enabled bool `json:"enabled"` // 默认 false
+	} `json:"metrics"`
+
+	// Alerting 可用性阈值告警（webhook 推送）。默认**关闭**：关闭时不起 goroutine、
+	// 不发任何 HTTP，行为与改动前逐字一致。目标 URL 由运维自备（自建接收端或
+	// 企业微信/钉钉/Slack 的 incoming webhook）；网关从不因此调用上游。
+	//
+	// 阈值语义：min_healthy_* 是"最低可接受健康账号数"，**低于**该值才告警
+	// （min=1 即"健康数为 0 时告警"）；**0 = 关闭该规则**——所以它是哨兵值而非
+	// "未设置"，normalize 不会把 0 回落成默认（纯 CN 部署没有 global 账号，
+	// min_healthy_global 默认 0 关闭，否则会常驻误报）。
+	Alerting struct {
+		Enabled             bool   `json:"enabled"`               // 默认 false
+		WebhookURL          string `json:"webhook_url"`           // enabled 时必填，scheme 限 http/https
+		Secret              string `json:"secret"`                // 非空则对 body 做 HMAC-SHA256 签名
+		IntervalSeconds     int    `json:"interval_seconds"`      // 评估周期，默认 30
+		TimeoutSeconds      int    `json:"timeout_seconds"`       // webhook 超时，默认 5
+		StartupGraceSeconds int    `json:"startup_grace_seconds"` // 启动宽限（避开 auths 未 sync 的 0 健康态），默认 30
+		MinHealthyCN        int    `json:"min_healthy_cn"`        // 默认 1；0 = 关闭该规则
+		MinHealthyGlobal    int    `json:"min_healthy_global"`    // 默认 0 = 关闭（纯 CN 部署不误报）
+		RecoverHealthy      int    `json:"recover_healthy"`       // 恢复阈值（迟滞上沿），默认 1
+		BreakerThreshold    int    `json:"breaker_threshold"`     // 熔断账号数阈值，默认 0 = 关闭
+		ForTicks            int    `json:"for_ticks"`             // 连续满足多少拍才触发，默认 2
+		ClearTicks          int    `json:"clear_ticks"`           // 连续不满足多少拍才解除，默认 2
+		SendResolve         bool   `json:"send_resolve"`          // 恢复时是否也发通知，默认 false
+	} `json:"alerting"`
+
+	// Budget 当日积分预算闸（admission control）。默认**关闭**：
+	// daily_credit_limit 为 0 表示不限，行为与改动前逐字一致。
+	// 当日累计扣费达到上限后，网关直接拒掉后续对话请求（429 + 明确错误码），
+	// 把积分损失截断在阈值附近——防的是跑飞的客户端、忘了关的脚本把积分烧光。
+	Budget struct {
+		// DailyCreditLimit 当日累计 credit 上限。**0 = 关闭该闸**（不限）——这是
+		// 哨兵值而非"未设置"，normalize 不会把它回落成默认值；负值报错。
+		// 计数按 CST 自然日重置（上游增长体系按 CST 刷新），进程重启即清零。
+		// 只统计上游 usage 给出 credit 的请求，故当日用量是**下界**、真实日耗只会
+		// 更多，阈值宜按保守值设（可先把闸当观察模式跑几天，看 /status 的
+		// daily_budget.used 再定）。
+		DailyCreditLimit float64 `json:"daily_credit_limit"`
+	} `json:"budget"`
 
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
@@ -253,6 +312,27 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// Metrics.Enabled / Admin.Enabled 缺省 false（零值）：管理面与指标面都不默认暴露，
+	// 老 config 不含这两个键时行为逐字不变。这里显式写出以明示默认值意图。
+	c.Metrics.Enabled = false
+	// 审计同样缺省关闭；路径给默认值（与 state_file 同目录约定）——开关关着时
+	// 该路径是惰性的，写出来只是让 config.example.json 的取值与实现一致。
+	c.Admin.AuditEnabled = false
+	c.Admin.AuditFile = "./data/admin_audit.log"
+	// 预算闸缺省关闭：daily_credit_limit 的 0 是"不限"哨兵，**故意不回落默认值**
+	// （与 alerting.min_healthy_global 同风格）。这里显式写出以明示这一意图。
+	c.Budget.DailyCreditLimit = 0
+	// Alerting 缺省关闭；各阈值/周期给默认值，但 min_healthy_global 与
+	// breaker_threshold 的 0 是"关闭该规则"的哨兵，不能改（见 Config.Alerting 注释）。
+	c.Alerting.IntervalSeconds = 30
+	c.Alerting.TimeoutSeconds = 5
+	c.Alerting.StartupGraceSeconds = 30
+	c.Alerting.MinHealthyCN = 1
+	c.Alerting.MinHealthyGlobal = 0
+	c.Alerting.RecoverHealthy = 1
+	c.Alerting.BreakerThreshold = 0
+	c.Alerting.ForTicks = 2
+	c.Alerting.ClearTicks = 2
 	return c
 }
 
@@ -370,6 +450,75 @@ func applyEnv(c *Config) {
 			c.Admin.Enabled = b
 		}
 	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Admin.AuditEnabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ADMIN_AUDIT_FILE"); v != "" {
+		c.Admin.AuditFile = v
+	}
+	if v := os.Getenv("WB2A_BUDGET_DAILY_CREDIT_LIMIT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			c.Budget.DailyCreditLimit = f
+		}
+	}
+	// 排程段的台账与当日失败重试（schedule.*）。三个键都进 env：容器部署改这一组
+	// 往往只为「补跑一次」或「把台账落到卷上」，不该逼着用户去改挂载的 config.json。
+	if v := os.Getenv("WB2A_SCHEDULE_LEDGER_FILE"); v != "" {
+		c.Schedule.LedgerFile = v
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_RETRY_DELAY_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.RetryDelayMinutes = n
+		}
+	}
+	if v := os.Getenv("WB2A_SCHEDULE_RETRY_MAX_PER_DAY"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			c.Schedule.RetryMaxPerDay = n
+		}
+	}
+	if v := os.Getenv("WB2A_METRICS_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Metrics.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ALERTING_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Alerting.Enabled = b
+		}
+	}
+	if v := os.Getenv("WB2A_ALERTING_WEBHOOK_URL"); v != "" {
+		c.Alerting.WebhookURL = v
+	}
+	if v := os.Getenv("WB2A_ALERTING_SECRET"); v != "" {
+		c.Alerting.Secret = v
+	}
+	for _, e := range []struct {
+		key string
+		dst *int
+	}{
+		{"WB2A_ALERTING_INTERVAL_SECONDS", &c.Alerting.IntervalSeconds},
+		{"WB2A_ALERTING_TIMEOUT_SECONDS", &c.Alerting.TimeoutSeconds},
+		{"WB2A_ALERTING_STARTUP_GRACE_SECONDS", &c.Alerting.StartupGraceSeconds},
+		{"WB2A_ALERTING_MIN_HEALTHY_CN", &c.Alerting.MinHealthyCN},
+		{"WB2A_ALERTING_MIN_HEALTHY_GLOBAL", &c.Alerting.MinHealthyGlobal},
+		{"WB2A_ALERTING_RECOVER_HEALTHY", &c.Alerting.RecoverHealthy},
+		{"WB2A_ALERTING_BREAKER_THRESHOLD", &c.Alerting.BreakerThreshold},
+		{"WB2A_ALERTING_FOR_TICKS", &c.Alerting.ForTicks},
+		{"WB2A_ALERTING_CLEAR_TICKS", &c.Alerting.ClearTicks},
+	} {
+		if v := os.Getenv(e.key); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				*e.dst = n
+			}
+		}
+	}
+	if v := os.Getenv("WB2A_ALERTING_SEND_RESOLVE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Alerting.SendResolve = b
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -472,12 +621,105 @@ func (c *Config) normalize() error {
 	if c.Admin.Enabled && strings.TrimSpace(c.APIKey) == "" {
 		return fmt.Errorf("admin.enabled=true 但 api_key 为空：请设置 api_key 或将 admin.enabled 置 false")
 	}
+	// 审计段的 fail-fast，与上面的 admin 校验并列（同属"开了功能就必须给齐参数"）：
+	//   - audit_enabled=true 而 admin.enabled=false：审计的对象就是 /admin 端点，
+	//     端点不存在时开着审计是个永远不会写一行的空配置——它比报错更危险，因为
+	//     运维会以为"审计已经在跑了"。
+	//   - 路径为空：无从落盘（Default 已给默认值，走到这里说明被显式置空了）。
+	if c.Admin.AuditEnabled {
+		if !c.Admin.Enabled {
+			return fmt.Errorf("admin.audit_enabled=true 但 admin.enabled=false：审计的对象是 /admin 端点，请同时开启 admin.enabled")
+		}
+		if strings.TrimSpace(c.Admin.AuditFile) == "" {
+			return fmt.Errorf("admin.audit_enabled=true 但 admin.audit_file 为空：请填写审计日志路径或将 admin.audit_enabled 置 false")
+		}
+	}
+	// 预算闸：只有负值非法。0 是"不限"的合法哨兵，**不回落**——把 0 改写成某个
+	// 默认上限，等于在老部署上凭空开始拒请求，正是"缺省 = 旧行为"要禁止的事。
+	if c.Budget.DailyCreditLimit < 0 {
+		return fmt.Errorf("budget.daily_credit_limit: %v 不得为负；0 = 关闭该闸（不限）", c.Budget.DailyCreditLimit)
+	}
+	// 告警段归一 + fail-fast（enabled=true 且 webhook_url 缺失/非法 → 拒绝启动）。
+	// 位置与上面的 admin 校验并列：两者都是"开了功能就必须给齐参数"的启动期拦截。
+	if err := c.normalizeAlerting(); err != nil {
+		return err
+	}
 	// 排程段归一（空数组回落默认、ActivityReportCount 归一、小时范围校验）
 	// 由 internal/config 统一实现，cmd/server 与 cmd/activity 共用同一份语义。
 	if err := c.Schedule.Normalize(); err != nil {
 		return err
 	}
 	return c.normalizePrompt()
+}
+
+// normalizeAlerting 归一并校验 alerting 段。
+//
+// 三件事：
+//  1. 周期/宽限/拍数：0（未设置）回落默认；**负值报错**（负数无合理语义，静默回落
+//     会掩盖配置笔误）。
+//  2. 阈值：min_healthy_cn / min_healthy_global / breaker_threshold 的 **0 是合法
+//     哨兵 = 关闭该规则**，不回落、不报错；只有负值报错。recover_healthy 的 0
+//     回落默认 1（0 会让迟滞失效：healthy>=0 恒为真 → 告警立刻解除）。
+//  3. enabled=true 时 webhook_url 必须非空且 scheme ∈ {http,https}、有主机名——
+//     fail-fast 而非运行时空转（风格同 admin.enabled + 空 api_key）。
+func (c *Config) normalizeAlerting() error {
+	a := &c.Alerting
+
+	for _, f := range []struct {
+		name string
+		val  int
+	}{
+		{"alerting.min_healthy_cn", a.MinHealthyCN},
+		{"alerting.min_healthy_global", a.MinHealthyGlobal},
+		{"alerting.breaker_threshold", a.BreakerThreshold},
+		{"alerting.recover_healthy", a.RecoverHealthy},
+		{"alerting.interval_seconds", a.IntervalSeconds},
+		{"alerting.timeout_seconds", a.TimeoutSeconds},
+		{"alerting.startup_grace_seconds", a.StartupGraceSeconds},
+		{"alerting.for_ticks", a.ForTicks},
+		{"alerting.clear_ticks", a.ClearTicks},
+	} {
+		if f.val < 0 {
+			return fmt.Errorf("%s: 不得为负", f.name)
+		}
+	}
+
+	if a.IntervalSeconds == 0 {
+		a.IntervalSeconds = 30
+	}
+	if a.TimeoutSeconds == 0 {
+		a.TimeoutSeconds = 5
+	}
+	if a.StartupGraceSeconds == 0 {
+		a.StartupGraceSeconds = 30
+	}
+	if a.ForTicks == 0 {
+		a.ForTicks = 2
+	}
+	if a.ClearTicks == 0 {
+		a.ClearTicks = 2
+	}
+	if a.RecoverHealthy == 0 {
+		a.RecoverHealthy = 1
+	}
+
+	if a.Enabled {
+		raw := strings.TrimSpace(a.WebhookURL)
+		if raw == "" {
+			return fmt.Errorf("alerting.enabled=true 但 alerting.webhook_url 为空：请填写告警投递地址或将 alerting.enabled 置 false")
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			return fmt.Errorf("alerting.webhook_url: %w", err)
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("alerting.webhook_url: scheme 必须是 http 或 https，got %q", u.Scheme)
+		}
+		if u.Host == "" {
+			return fmt.Errorf("alerting.webhook_url: 缺少主机名")
+		}
+	}
+	return nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
