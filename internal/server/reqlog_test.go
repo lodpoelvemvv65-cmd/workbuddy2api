@@ -16,6 +16,7 @@ func mkStat(model string, status, toks int) *chatStat {
 		mode:      "stream",
 		uid:       "00e26541abcdef",
 		nick:      "sample",
+		source:    "claude-code",
 		ttfb:      400 * time.Millisecond,
 		toks:      toks,
 		status:    status,
@@ -64,6 +65,9 @@ func TestRequestLogRingOrderAndLimit(t *testing.T) {
 	}
 	if e.UID != "00e26541abcdef" || e.Nickname != "sample" {
 		t.Errorf("account=%q/%q", e.UID, e.Nickname)
+	}
+	if e.Source != "claude-code" {
+		t.Errorf("source=%q want claude-code", e.Source)
 	}
 	if e.TTFBMS != 400 {
 		t.Errorf("ttfb=%d", e.TTFBMS)

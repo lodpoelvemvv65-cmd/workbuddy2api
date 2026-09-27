@@ -232,7 +232,7 @@ var accountFaultRule = errorRule{kind: ErrAccountFault, mode: matchFold, pattern
 //
 // 只在 400/404/413 请求级状态码上判（429+11115 概率极低且属限流语义优先，
 // 5xx 属服务端故障优先）——与 IsModelBlocked 的 400/404 口径同理。误判代价
-//（好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
+// （好 body 被归 prompt_too_long）：不罚号 + 不轮转 + 透传原文，客户端看到
 // 上游原文可自行排查，代价可控。
 var promptTooLongRule = errorRule{kind: ErrPromptTooLong, mode: matchFold, patterns: []string{
 	`"code":11115`,
@@ -267,7 +267,7 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 错误风暴（429 轰炸）时尤甚。模式串均为纯常量，与 sanitize.go 的包级
 // 预编译先例保持一致。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -660,6 +660,11 @@ type Client struct {
 	// globalModels 缓存 global 模型名目录纯动态探测结果（1h TTL + 5min 负缓存），
 	// 见 global_models.go。按实例持有，测试新建 Client 即隔离。
 	globalModels fetchGlobalModelsCache
+
+	// promotionsMu/promotions 缓存上游模型促销活动（/v3/config data.modelPromotions，
+	// 见 promotions.go），键按 realm 分层（cn/global）。仅展示用，不参与选号。
+	promotionsMu sync.RWMutex
+	promotions   map[string][]ModelPromotion
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
@@ -1065,6 +1070,10 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	// 回写实际出站的思考档位（prepareBody 已注入 thinking/默认 effort 并降级）。
+	if meta.EffortOut != nil {
+		*meta.EffortOut = extractReasoningEffort(prepared)
+	}
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 + 尾部
 	// 不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1454,6 +1463,9 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	if len(names) == 0 {
 		return nil, fmt.Errorf("v3 config empty list")
 	}
+	// 促销活动与模型目录同响应（data.modelPromotions）：解析后按 realm 落缓存，
+	// 供 /v1/models 与面板展示「限时免费 / 截止时间」。空列表不清既有缓存。
+	c.storePromotions(a.Realm(), parseModelPromotions(raw))
 	// v3 面全量 models 不经 agents[cli] 过滤，nes-/completion-/codewise- 嵨补全/图片
 	// 生成等非对话条目（企业端点的 nonChatModel 口径）同样要挡在目录外——
 	// 这里按同一 nonChatModel 规则过滤（selected ID 会选模型报 code=11102）。

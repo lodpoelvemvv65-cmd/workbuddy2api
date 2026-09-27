@@ -551,13 +551,17 @@ func applyAnthropicThinking(out map[string]any, raw json.RawMessage, model strin
 }
 
 // effortForBudget budget_tokens → reasoning_effort 档位（上游按模型支持度降级）。
+//
+// 边界对齐 pi 的 DEFAULT_THINKING_BUDGETS {minimal:1024, low:2048, medium:8192,
+// high:16384}：high 正好是 16384，因此 medium 档必须用 `< 16384` 而非 `<= 16384`，
+// 否则 pi 的 high 会被误判成 medium（实测：改 high 后网关仍打 medium -> high）。
 func effortForBudget(budget int) string {
 	switch {
 	case budget <= 0:
 		return "medium"
 	case budget <= 4096:
 		return "low"
-	case budget <= 16384:
+	case budget < 16384:
 		return "medium"
 	default:
 		return "high"

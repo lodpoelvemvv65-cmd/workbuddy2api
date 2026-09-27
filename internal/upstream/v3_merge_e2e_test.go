@@ -88,7 +88,7 @@ func TestV3MergeE2EEndpointsReachable(t *testing.T) {
 		GlobalEnabled: true,
 	}
 	for _, path := range []string{v3ConfigPath, globalModelsPath} {
-		names, infos, _, _, err := c.globalModelsOnce(a, path)
+		names, infos, _, _, _, err := c.globalModelsOnce(a, path)
 		if err != nil {
 			t.Errorf("endpoint %s: %v (want 200 + parse ok)", path, err)
 			continue

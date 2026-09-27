@@ -170,6 +170,10 @@ type Config struct {
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到查余额时，到期时间在此窗口内
 		// 的积分被标记为"快过期"，选号优先消耗（issue:积分过期）。空/0 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
+		// ChainPreferCNFirst 候选链域优先：true 时把 CN 域候选整体排在 global 之前
+		// （排序 = 域优先 → 免费优先 → 倍率升序）。默认 false = 现状（纯按成本排序，
+		// 全局免费档优先）。用户偏好「国内优先」时置 true。
+		ChainPreferCNFirst bool `json:"chain_prefer_cn_first"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
 		// tier 1-only（探索=搭车改道，零新增上游请求；成功即毕业，失败走既有

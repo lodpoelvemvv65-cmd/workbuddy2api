@@ -130,7 +130,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 	}
 	c.globalModels.Unlock()
 
-	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
+	names, infos, efforts, defaults, _, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
 		c.globalModels.Lock()
@@ -176,30 +176,31 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 模型 id（如 gpt-5.3-codex 只在 /v2，作为补充进并集）；去重 key = 模型 id，输出顺序
 // 稳定（v3 原序在前、企业端点补充项在后）。两路全失败才返回错误（等价原「家族端点全
 // 非 2xx」负缓存语义）；单路失败降级为另一路结果 + warn 日志，互不拖累。
-func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, promos []ModelPromotion, err error) {
 	type probeResult struct {
 		names    []string
 		infos    []ModelInfo
 		efforts  map[string][]string
 		defaults map[string]string
+		promos   []ModelPromotion
 		err      error
 	}
 	v3Ch := make(chan probeResult, 1)
 	enterpriseCh := make(chan probeResult, 1)
 	go func() {
-		names, infos, efforts, defaults, perr := c.globalModelsOnce(a, v3ConfigPath)
-		v3Ch <- probeResult{names, infos, efforts, defaults, perr}
+		names, infos, efforts, defaults, promos, perr := c.globalModelsOnce(a, v3ConfigPath)
+		v3Ch <- probeResult{names, infos, efforts, defaults, promos, perr}
 	}()
 	go func() {
 		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
 		var lastErr error
 		for _, path := range globalModelsProbePaths {
-			names, infos, efforts, defaults, perr := c.globalModelsOnce(a, path)
+			names, infos, efforts, defaults, promos, perr := c.globalModelsOnce(a, path)
 			if perr != nil {
 				lastErr = perr
 				continue
 			}
-			enterpriseCh <- probeResult{names, infos, efforts, defaults, nil}
+			enterpriseCh <- probeResult{names, infos, efforts, defaults, promos, nil}
 			return
 		}
 		enterpriseCh <- probeResult{err: lastErr}
@@ -209,22 +210,26 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 
 	if v3.err != nil && enterprise.err != nil {
 		// 两路全失败 → 负缓存语义（等价原家族端点全非 2xx）。
-		return nil, nil, nil, nil, v3.err
+		return nil, nil, nil, nil, nil, v3.err
 	}
 	if v3.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（任务书实现要点：降级仅企业端点 + warn）。
 		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
-		return enterprise.names, enterprise.infos, enterprise.efforts, enterprise.defaults, nil
+		c.storePromotions("global", enterprise.promos)
+		return enterprise.names, enterprise.infos, enterprise.efforts, enterprise.defaults, enterprise.promos, nil
 	}
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] global models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
-		return v3.names, v3.infos, v3.efforts, v3.defaults, nil
+		c.storePromotions("global", v3.promos)
+		return v3.names, v3.infos, v3.efforts, v3.defaults, v3.promos, nil
 	}
 	// 两路皆成功：v3 为主、企业端点补缺合并。
 	names, infos = mergeGlobalCatalog(v3.names, v3.infos, enterprise.names, enterprise.infos)
 	efforts = mergeEffortBuckets(v3.efforts, enterprise.efforts)
 	defaults = mergeEffortDefaults(v3.defaults, enterprise.defaults)
-	return names, infos, efforts, defaults, nil
+	promos = mergePromotions(v3.promos, enterprise.promos)
+	c.storePromotions("global", promos)
+	return names, infos, efforts, defaults, promos, nil
 }
 
 // mergeGlobalCatalog 两路合并（v3 主、企业补缺）：names 按 id 去重（v3 原序在前、
@@ -303,29 +308,34 @@ func mergeEffortDefaults(primary, secondary map[string]string) map[string]string
 	return out
 }
 
-// globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, infos, efforts, defaults, nil)；否则 (nil,...,err)。
-func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelInfo, map[string][]string, map[string]string, error) {
+// globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, infos, efforts, defaults, promos, nil)；否则 (nil,...,err)。
+func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelInfo, map[string][]string, map[string]string, []ModelPromotion, error) {
 	url := c.chatBase(a) + path // 按 realm 切 base：global 账号 → global base
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	c.CommonHeaders(req, a) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（探测负缓存走 lastFail，不罚号）。
-		return nil, nil, nil, nil, fmt.Errorf("read body: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("read body: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, nil, nil, fmt.Errorf("global models status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, nil, nil, nil, nil, fmt.Errorf("global models status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
-	return parseGlobalModelNames(raw)
+	names, infos, efforts, defaults, err := parseGlobalModelNames(raw)
+	if err != nil {
+		return nil, nil, nil, nil, nil, err
+	}
+	// 促销活动与模型目录同响应（data.modelPromotions）：一并解析交调用方合并/落缓存。
+	return names, infos, efforts, defaults, parseModelPromotions(raw), nil
 }
 
 // parseGlobalModelNames 容忍两种形态解析模型名：

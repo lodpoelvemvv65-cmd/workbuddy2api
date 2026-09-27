@@ -54,8 +54,10 @@ type chatStat struct {
 	start  time.Time
 	model  string
 	mode   string // "stream" | "sync"
+	effort string // 实际出站的 reasoning_effort（上游 prepareBody 后回写）
 	uid    string // 完整 uid，展示时只取前 8 位
 	nick   string // 账号昵称（auth.Auth.Nickname，登录时落盘）；空则只显示 uid8
+	source string // 客户端来源标签（detectClientSource），供面板「来源」列
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
@@ -92,7 +94,7 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	total := time.Since(s.start)
-	seq := logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	seq := logChatRow(s.ttfb, total, s.model, s.mode, s.uid, s.nick, s.status, s.toks, s.effort)
 	recordChatMetric(s, total)
 	// 最近流水环形缓冲（/v1/logs 数据源）。与表格日志同点写入，seq 共用——
 	// 页面上的 #序号与日志文件逐条对齐，排障时可互相指认。
@@ -126,6 +128,10 @@ type chatStatsReader struct {
 	// ——断流事实在透传层被有意吞掉，不记这行就只能靠"usage 缺失"间接猜测，
 	// 与"上游本就不给 usage"混为一谈，出问题时无从取证。
 	sawEOF bool
+
+	// diag 退化重复诊断累积器（repdiag.go）：旁路累积思维链/正文并检测循环。
+	// 值类型零值可用；parseSSELine 喂入，handler 在流结束后读 Hit()。
+	diag repDiag
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -186,8 +192,36 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptCacheMissTokens  int `json:"prompt_cache_miss_tokens"`
 			PromptCacheWriteTokens int `json:"prompt_cache_write_tokens"`
 		} `json:"usage"`
+		// 退化重复诊断：累积思维链/正文（见 repdiag.go）。与 usage 解析解耦——
+		// 大量中间帧没有 usage，但正是这些帧携带要检测的复读内容。
+		Choices []struct {
+			Delta struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"delta"`
+			Message struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
+		return
+	}
+	// 旁路喂入重复诊断（delta 优先，缺则取整条 message 形态）。
+	for _, c := range chunk.Choices {
+		rc := c.Delta.ReasoningContent
+		if rc == "" {
+			rc = c.Message.ReasoningContent
+		}
+		txt := c.Delta.Content
+		if txt == "" {
+			txt = c.Message.Content
+		}
+		s.diag.feedReasoning(rc)
+		s.diag.feedContent(txt)
+	}
+	if chunk.Usage == nil {
 		return
 	}
 	s.hasUsage = true
@@ -296,7 +330,7 @@ const (
 //   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) int64 {
+func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int, effort string) int64 {
 	if !chatLogEnabled {
 		return 0
 	}
@@ -304,6 +338,10 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status
 	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
 	// 账号标签只补不截：超宽时宁可让该行变宽，也不丢昵称信息（昵称是排查的主线索）。
 	acct := logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
+	effortField := effort
+	if effortField == "" {
+		effortField = "-"
+	}
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
@@ -318,11 +356,12 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(statsWriter(), "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |\n",
+	fmt.Fprintf(statsWriter(), "| #%03d | %s | %s | %s | effort=%-6s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
+		effortField,
 		status,
 		acct,
 		logfmt.Pad(ttfbMS, chatTTFBWidth),

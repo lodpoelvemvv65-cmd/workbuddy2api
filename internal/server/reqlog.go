@@ -29,13 +29,15 @@ const requestLogCapacity = 1000
 // 页面应显示占位符而不是 0；completion_tokens=-1 是 usage 缺失哨兵（沿用 chatStat
 // 的口径），与 has_usage 互相印证。
 type RequestLogEntry struct {
-	Seq      int64     `json:"seq"`
-	Time     time.Time `json:"time"`
-	Model    string    `json:"model"`
-	Mode     string    `json:"mode"` // "stream" | "sync"
-	Status   int       `json:"status"`
-	UID      string    `json:"uid,omitempty"`
-	Nickname string    `json:"nickname,omitempty"`
+	Seq             int64     `json:"seq"`
+	Time            time.Time `json:"time"`
+	Model           string    `json:"model"`
+	Mode            string    `json:"mode"` // "stream" | "sync"
+	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
+	Status          int       `json:"status"`
+	Source          string    `json:"source,omitempty"` // 客户端来源（claude-code / codex-cli / pi-cli …）
+	UID             string    `json:"uid,omitempty"`
+	Nickname        string    `json:"nickname,omitempty"`
 
 	TTFBMS     int64 `json:"ttfb_ms,omitempty"` // 0 = 无观测（非流式）
 	DurationMS int64 `json:"duration_ms"`
@@ -77,16 +79,18 @@ var requestLog struct {
 // 逐条对齐，排障时能互相指认。total 为端到端耗时。
 func appendRequestLog(s *chatStat, total time.Duration, seq int64) {
 	e := RequestLogEntry{
-		Seq:        seq,
-		Time:       time.Now(),
-		Model:      s.model,
-		Mode:       s.mode,
-		Status:     s.status,
-		UID:        s.uid,
-		Nickname:   s.nick,
-		DurationMS: total.Milliseconds(),
-		HasUsage:   s.hasUsage,
-		HasCredit:  s.hasCredit,
+		Seq:             seq,
+		Time:            time.Now(),
+		Model:           s.model,
+		Mode:            s.mode,
+		ReasoningEffort: s.effort,
+		Status:          s.status,
+		Source:          s.source,
+		UID:             s.uid,
+		Nickname:        s.nick,
+		DurationMS:      total.Milliseconds(),
+		HasUsage:        s.hasUsage,
+		HasCredit:       s.hasCredit,
 	}
 	if s.ttfb > 0 {
 		e.TTFBMS = s.ttfb.Milliseconds()

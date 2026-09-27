@@ -75,6 +75,7 @@ func main() {
 	mux.HandleFunc("GET /api/stats", func(w http.ResponseWriter, r *http.Request) { d.proxy(w, r, "/v1/stats") })
 	mux.HandleFunc("GET /api/status", func(w http.ResponseWriter, r *http.Request) { d.proxy(w, r, "/status") })
 	mux.HandleFunc("GET /api/logs", func(w http.ResponseWriter, r *http.Request) { d.proxy(w, r, "/v1/logs") })
+	mux.HandleFunc("GET /api/models", func(w http.ResponseWriter, r *http.Request) { d.proxy(w, r, "/v1/models") })
 
 	srv := &http.Server{Addr: *listen, Handler: mux}
 

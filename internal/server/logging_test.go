@@ -199,7 +199,7 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4.1-flash", "stream", "00e26541abcdef", "sample", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4.1-flash", "stream", "00e26541abcdef", "sample", http.StatusOK, 1234, "high")
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4.1-flash", "| stream |", "| 200 |", "sample(00e26541)", "TTFB=412ms", "tok=1234", "tok/s", "total=",
@@ -220,7 +220,7 @@ func TestLogChatRowModelNotTruncated(t *testing.T) {
 	withChatLog(t)
 	for _, model := range []string{"cn:deepseek-v4.1-flash", "global:deepseek-v4.1-flash"} {
 		out := captureStdout(t, func() {
-			logChatRow(0, time.Second, model, "stream", "00e26541abcdef", "sample", http.StatusOK, 1)
+			logChatRow(0, time.Second, model, "stream", "00e26541abcdef", "sample", http.StatusOK, 1, "high")
 		})
 		if !strings.Contains(out, model) {
 			t.Errorf("model %q truncated to something else:\n%s", model, out)
@@ -232,7 +232,7 @@ func TestLogChatRowModelNotTruncated(t *testing.T) {
 func TestLogChatRowNicknameFallback(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "00e26541abcdef", "", http.StatusOK, 1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "00e26541abcdef", "", http.StatusOK, 1, "high")
 	})
 	if !strings.Contains(out, "00e26541 ") && !strings.Contains(out, "00e26541|") {
 		t.Errorf("want bare uid8 label without nickname:\n%s", out)
@@ -245,7 +245,7 @@ func TestLogChatRowNicknameFallback(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", "", http.StatusServiceUnavailable, -1, "high")
 	})
 	for _, want := range []string{"TTFB=-", "tok=-", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -261,8 +261,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1, "high")
+		logChatRow(0, time.Second, "m", "sync", "u", "", 200, 1, "high")
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -457,7 +457,7 @@ func TestSetStatsOutputRedirectsChatRow(t *testing.T) {
 	var buf bytes.Buffer
 	SetStatsOutput(&buf)
 	t.Cleanup(func() { SetStatsOutput(nil) })
-	logChatRow(0, time.Second, "glm-5.2", "sync", "u1", "", 200, 1)
+	logChatRow(0, time.Second, "glm-5.2", "sync", "u1", "", 200, 1, "high")
 	if !strings.Contains(buf.String(), "| #") {
 		t.Errorf("SetStatsOutput 未生效，输出=%q", buf.String())
 	}

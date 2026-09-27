@@ -55,6 +55,10 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
+	// ChainPreferCNFirst 候选链域优先：true 时 CN 域候选整体排在 global 之前
+	// （config pool.chain_prefer_cn_first）。域内仍「免费优先 → 倍率升序」。
+	ChainPreferCNFirst bool
+
 	// AdminEnabled 运维管理端点开关（config admin.enabled，默认 false）。
 	// 关闭时 /admin/* 一律 404（而非 403——不向外暴露"这里存在管理面"）。
 	AdminEnabled bool
@@ -475,6 +479,60 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 	return entry
 }
 
+// applyModelPromotions 把上游模型促销活动（/v3/config data.modelPromotions，见
+// upstream.ModelPromotion）中作用于该模型的条目合入 /v1/models 条目，供面板/客户端
+// 展示「限时免费 / 夜间折扣」标签与截止时间。仅展示用，不参与选号。
+// 目录缓存冷 / 无命中 / 无促销缓存 → 不写字段（不编造）。
+func applyModelPromotions(entry map[string]any, up *upstream.Client, realm, bareID string) {
+	promos := up.PromotionsSnapshot(realm)
+	if len(promos) == 0 {
+		return
+	}
+	now := time.Now()
+	list := make([]map[string]any, 0, 2)
+	for _, p := range promos {
+		if !p.AppliesTo(bareID) {
+			continue
+		}
+		item := map[string]any{
+			"label":  p.BadgeLabel,
+			"kind":   p.Kind,
+			"active": p.ActiveAt(now),
+		}
+		if p.BadgeColor != "" {
+			item["color"] = p.BadgeColor
+		}
+		if p.BadgeDisplay != "" {
+			item["display"] = p.BadgeDisplay
+		}
+		if p.HasDiscount {
+			item["factor"] = p.Factor
+			if p.DiscountedCredits != "" {
+				item["discounted_credits"] = p.DiscountedCredits
+			}
+		}
+		if p.HoverTextZh != "" {
+			item["text"] = p.HoverTextZh
+		}
+		if p.ValidFrom != "" {
+			item["valid_from"] = p.ValidFrom
+		}
+		if p.ValidUntil != "" {
+			item["valid_until"] = p.ValidUntil
+		}
+		if len(p.Daily) > 0 {
+			item["daily"] = p.Daily
+		}
+		if p.Timezone != "" {
+			item["timezone"] = p.Timezone
+		}
+		list = append(list, item)
+	}
+	if len(list) > 0 {
+		entry["promotions"] = list
+	}
+}
+
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
 // CN 模型输出统一加 "cn:" 前缀（gateway 路由协议，与 resolveModel 对称）。
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底；
@@ -500,6 +558,8 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
 		entry = applyModelInfoFields(entry, mi)
+		// 促销活动（限时免费/折扣 + 截止时间）透出，仅展示。
+		applyModelPromotions(entry, h.cfg.Upstream, "cn", mi.ID)
 		// P0：effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 		// （issue #84 客户端可发现档位，不再盲传）。无档位→省略字段（非空数组）。
 		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
@@ -551,6 +611,8 @@ func (h *Handler) modelList() []map[string]any {
 					entry["reasoning_default_effort"] = def
 				}
 			}
+			// 促销活动（限时免费/折扣 + 截止时间）透出，仅展示。
+			applyModelPromotions(entry, h.cfg.Upstream, "global", id)
 			out = append(out, entry)
 		}
 	}
@@ -680,6 +742,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	// 客户端来源（面板「来源」列）：只读请求头 + 协议路径推断，纯展示用途。
+	// 在 r.Clone 之后调用同样成立——Clone 保留全部头与 URL。
+	st.source = detectClientSource(r.Header, r.URL.Path)
 	if aliased {
 		// 别名命中：流水/指标记实际用的模型名，否则日志里只有一个对不上的短名。
 		st.model = peek.Model
@@ -833,7 +898,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//       也空走 NewMessageID 请求级（TurnRequestID 空键行为）——轮转内捕获
 	//       一次即共享。
 	//   - messageID 在 ChatHeaders 内每条消息生成（消息级独立，无需外部可见）。
-	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body)}
+	chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(body), EffortOut: &st.effort}
 	if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
 		chatMeta.ConversationRequestID = v
 	} else if turnKey != "" && sessKey != "" {
@@ -858,6 +923,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑。
+				// 关键：realm 不符时必须同时丢弃 acct（置 nil），否则会用错域的账号继续发请求
+				// （实测：global 免费候选被粘性 CN 号顶掉 → 白扣积分，候选链「免费优先→积分兜底」失效）。
+				acct = nil
 				unbindSticky()
 			}
 		}
@@ -1075,6 +1143,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
+			// 退化重复诊断（repdiag.go）：模型陷入思维链/正文复读时打 WARN（含复读
+			// 单元样例与规模），并按 WB2A_DUMP_RESP 落盘请求体 + 思维链/正文原文。
+			// 这是「tok=65536 长流到底在复读什么」的唯一直接证据（流水行只有 token 数）。
+			if _, _, _, _, _, hit := stats.diag.Hit(); hit {
+				logRepetition(logfmt.Label(acct.UID, acct.Nickname), bareModel, st.effort, &stats.diag)
+				DumpRepetition(dumpRespDir(), body, stats.diag.ReasoningText(), stats.diag.ContentText())
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1148,6 +1223,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		// 退化重复诊断（非流式）：与流式同口径，从聚合响应取思维链/正文检测。
+		if d := diagFromChatResponse(resp); d != nil {
+			if _, _, _, _, _, hit := d.Hit(); hit {
+				logRepetition(logfmt.Label(acct.UID, acct.Nickname), bareModel, st.effort, d)
+				DumpRepetition(dumpRespDir(), body, d.ReasoningText(), d.ContentText())
+			}
+		}
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)

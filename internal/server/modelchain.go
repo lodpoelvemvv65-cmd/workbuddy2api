@@ -207,9 +207,17 @@ func (h *Handler) modelChain(clientModel, prefRealm, bareModel string) []modelCa
 		}
 	}
 
+	// 域优先（可配）：CN 域候选整体排在 global 之前（config pool.chain_prefer_cn_first，
+	// 默认关 = 现状纯按成本排序）。开启后顺序 = 域优先 → 免费优先 → 倍率升序。
 	// 免费优先 → 未知 → 倍率升序；同价时显式前缀域优先。
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
+		if h.cfg.ChainPreferCNFirst {
+			ac, bc := a.Realm == "cn", b.Realm == "cn"
+			if ac != bc {
+				return ac
+			}
+		}
 		if a.known != b.known {
 			return a.known
 		}

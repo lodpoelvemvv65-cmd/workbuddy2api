@@ -137,6 +137,56 @@ func TestModelChainFreeFirst(t *testing.T) {
 	assertChain(t, h.modelChain("glm-5.3-flash", "cn", "glm-5.3-flash"), []string{"cn|glm-5.3-flash"})
 }
 
+// TestModelChainPreferCNFirst 域优先开关（config pool.chain_prefer_cn_first）：
+// 关闭（默认）= 纯成本排序（全局免费档最前）；开启 = CN 域整体最前，
+// 之后才是全局免费、全局积分（顺序 = 域优先 → 免费 → 倍率升序）。
+func TestModelChainPreferCNFirst(t *testing.T) {
+	defer resetModelsCache()
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+
+	// CN 目录：deepseek-v4.1-flash x0.11（积分）。
+	seedModelsCache([]upstream.ModelInfo{
+		{ID: "deepseek-v4.1-flash", Credits: "x0.11", ContextWindow: 1000000},
+	})
+
+	// global 目录：deepseek-v4.1-flash x0.00（免费）+ deepseek-v4.1-flash-sg x0.03（积分）。
+	const globalBody = `{"code":0,"data":{"models":[` +
+		`{"id":"deepseek-v4.1-flash","credits":"x0.00","maxInputTokens":1000000},` +
+		`{"id":"deepseek-v4.1-flash-sg","credits":"x0.03","maxInputTokens":1000000}]}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, globalBody)
+	}))
+	defer srv.Close()
+
+	up := &upstream.Client{
+		HTTP:           &http.Client{},
+		ChatBaseGlobal: srv.URL,
+		GlobalEnabled:  true,
+	}
+	ga := &auth.Auth{UID: "g1", AccessToken: "at", Domain: "www.workbuddy.ai"}
+	up.FetchGlobalModels(ga)
+	if got := up.FetchGlobalModelInfos(ga); len(got) == 0 {
+		t.Fatal("global 目录未种入")
+	}
+
+	// 关闭（默认）：全局免费档排最前。
+	off := NewHandler(Config{Pool: testPoolWith(), Upstream: up, GlobalEnabled: true})
+	assertChain(t, off.modelChain("deepseek-v4.1-flash", "cn", "deepseek-v4.1-flash"), []string{
+		"global|deepseek-v4.1-flash",
+		"global|deepseek-v4.1-flash-sg",
+		"cn|deepseek-v4.1-flash",
+	})
+	// 开启：CN 域最前，然后全局免费、全局积分。
+	on := NewHandler(Config{Pool: testPoolWith(), Upstream: up, GlobalEnabled: true, ChainPreferCNFirst: true})
+	assertChain(t, on.modelChain("deepseek-v4.1-flash", "cn", "deepseek-v4.1-flash"), []string{
+		"cn|deepseek-v4.1-flash",
+		"global|deepseek-v4.1-flash",
+		"global|deepseek-v4.1-flash-sg",
+	})
+}
+
 // TestModelChain1MMarker [1M] 标记只做档位过滤：有满足的候选就只留它们，
 // 一个都没有则退回全部（上游没有 1M 就用原来的，不退化成报错）。
 func TestModelChain1MMarker(t *testing.T) {

@@ -282,7 +282,7 @@ PID 写入 `wb2api.pid`，标准输出与错误日志分别写入 `data/server.o
 ### 验证
 
 ```bash
-# 模型列表
+# 模型列表（含上游促销活动：限时免费/折扣标签 + 截止时间，见 promotions 字段）
 curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
 
 # 账号状态（汇总 + 每账号详情，含 disabled / manual_disabled 双位）
@@ -308,12 +308,30 @@ curl -s http://localhost:7863/v1/chat/completions \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
 ```
 
+### 排障：模型退化重复（复读）
+
+上游 deepseek 系在 global 域被强制 `high` 思考档（`medium` 会被 floored 到 `high`），
+偶发陷入思维链/正文自我复读（如 `Let me run. Let me do it. …` 循环），一路跑到 token
+上限。网关会旁路检测这种退化，命中即在日志打一行 WARN：
+
+```
+WARN: [server] degenerate repetition acct=xxx(uid8) model=deepseek-v4.1-flash effort=high \
+  kind=reasoning unit="Let me run. Let me do it. Let me go. OK. Running. " repeats=87 \
+  reasoning_bytes=65536 content_bytes=0 (model stuck in a loop)
+```
+
+- 检测恒开、纯观测（不改写/延迟透传字节），每路文本只保留最近 512KB；
+- 想留存原文离线分析，设 `WB2A_DUMP_RESP=1`（或一个显式目录）：把请求体与
+  已累积的思维链/正文落到 `last_request.json` / `last_reasoning.txt` / `last_content.txt`，
+  目录默认 `/app/data`；
+- 既有 `WB2A_DUMP_REQ`（≥4MB 请求体落 `last_request.json`）不受影响。
+
 ### 可视化面板（独立进程）
 
 网关本身不含 Web UI（见「本项目不做什么」）；配套的独立面板 `cmd/dashboard` 把网关已有的
 数据端点聚合成一页——**缓存命中率**、**速度**（首字 TTFB / 吞吐）、**最近请求日志**、
-**账号池状态**。面板只读、无状态、零第三方依赖，通过服务端代理访问网关（api_key 只留在
-面板进程内，不下发到浏览器）。
+**账号池状态**、**模型目录 / 限时活动**。面板只读、无状态、零第三方依赖，通过服务端代理
+访问网关（api_key 只留在面板进程内，不下发到浏览器）。
 
 ```bash
 # 默认 :7864；网关地址与 key 自动取 config.json（也可用 -gateway / WB2A_URL 覆盖）
@@ -326,8 +344,19 @@ go run ./cmd/dashboard -listen :9000 -gateway http://127.0.0.1:7863
 - `GET /v1/stats` — 按模型的请求 / 缓存 / 速度 / 扣费聚合（已有；默认落盘 `./data/metrics.json`，重启延续，见「请求统计持久化」）；
 - `GET /status` — 账号池状态（已有）；
 - `GET /v1/logs?limit=N` — **最近请求流水**（本仓库新增端点）：网关内一份**有界内存
-  环形缓冲**（最近 1000 条，进程重启清零），字段与请求表格日志同构。它不依赖日志文件，
-  `log_file` 为空时照常工作，也不需要面板与网关同机。
+  环形缓冲**（最近 1000 条，进程重启清零），字段与请求表格日志同构（另多一个
+  `source` 字段，见下）。它不依赖日志文件，`log_file` 为空时照常工作，也不需要
+  面板与网关同机。
+- 「最近请求日志」的**来源**列：网关侧从请求头推断客户端（`User-Agent` /
+  `originator` / `x-app`，再回落协议名），无需客户端改动。已覆盖 Claude Code
+  （`claude-cli`）、Codex CLI（`codex_cli_rs` / `originator`）、pi（`pi (...)`）、
+  Cursor、Cherry Studio、OpenAI / Anthropic SDK 等；未收录的客户端（自研
+  desktop cli 等）可带 `X-Client-Source: my-desktop-cli` 自报来源，网关零改配置
+  即可在面板显示（该头仅用于展示，不参与鉴权/计费）。
+- `GET /v1/models` — **模型目录**：面板「模型目录 / 限时活动」区块据此展示每个模型的
+  倍率与上游促销活动（限时免费 / 夜间折扣的标签、折扣倍率、`valid_until` 截止时间倒计时
+  或每日时段、生效状态）。促销数据来自上游 `/v3/config` 的 `modelPromotions`，随模型目录
+  一同缓存（1h TTL），网关不额外发请求；缓存冷 / 无活动时不显示该字段（不编造）。
 
 页面每 5 秒自动刷新；趋势曲线由面板侧滚动采样（刷新页面即重置）。Docker 部署时
 `docker-compose.yml` 已附带 `dashboard` 服务，访问宿主机 `:7864` 即可。

@@ -252,6 +252,8 @@ func main() {
 		AnthropicDefaultModel: cfg.Anthropic.DefaultModel,
 		// global realm 开关（handler 侧第三道闸：modelList 据此决定是否列 global 名单）。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 候选链域优先：CN 域整体排在 global 之前（config pool.chain_prefer_cn_first）。
+		ChainPreferCNFirst: cfg.Pool.ChainPreferCNFirst,
 		// 运维管理端点开关（config admin.enabled，默认 false）。
 		AdminEnabled: cfg.Admin.Enabled,
 		// 模型别名表（config model_aliases）：客户端惯用短名 → 真实上游模型名。

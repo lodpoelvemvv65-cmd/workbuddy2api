@@ -18,6 +18,17 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 	return PrepareBodyOptWithEffortsAndDefault(src, sanitize, nil, nil)
 }
 
+// extractReasoningEffort 取出站 body 的 reasoning_effort（供请求日志 / 面板展示）。
+func extractReasoningEffort(body []byte) string {
+	var m struct {
+		ReasoningEffort string `json:"reasoning_effort"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return ""
+	}
+	return m.ReasoningEffort
+}
+
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。

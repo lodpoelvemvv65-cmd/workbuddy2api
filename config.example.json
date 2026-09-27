@@ -82,7 +82,8 @@
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
     "expiring_soon": "168h",
-    "cost_explore_interval": "30m"
+    "cost_explore_interval": "30m",
+    "chain_prefer_cn_first": false
   },
   "session_sticky": {
     "enabled": true,

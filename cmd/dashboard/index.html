@@ -55,6 +55,7 @@
   .pill.warn{color:var(--warn);border-color:rgba(242,179,75,.4);background:rgba(242,179,75,.08)}
   .pill.err{color:var(--err);border-color:rgba(239,95,107,.4);background:rgba(239,95,107,.08)}
   .pill.muted{color:var(--muted)}
+  .pill.src{color:var(--accent);border-color:rgba(79,140,255,.4);background:rgba(79,140,255,.08)}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px}
   .chip{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:6px 10px;font-size:12.5px}
   .chip b{font-size:14px;margin-left:4px}
@@ -103,6 +104,20 @@
   </section>
 
   <section>
+    <h2>模型目录 / 限时活动
+      <label class="meta" style="margin-left:10px;cursor:pointer">
+        <input type="checkbox" id="promoOnly" checked style="vertical-align:-1px"> 只看有活动
+      </label>
+      <span class="meta" id="catalogMeta"></span>
+    </h2>
+    <div class="panel scroll"><table id="catalog">
+      <thead><tr>
+        <th>模型</th><th>倍率</th><th>活动</th><th>截止 / 时段</th><th>说明</th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+
+  <section>
     <h2>账号池</h2>
     <div class="chips" id="poolChips"></div>
     <div class="panel scroll"><table id="accounts">
@@ -116,7 +131,7 @@
     <h2>最近请求日志 <span class="meta" id="logsMeta"></span></h2>
     <div class="panel scroll" style="max-height:520px"><table id="logs">
       <thead><tr>
-        <th>时间</th><th>#</th><th>模型</th><th>模式</th><th>状态</th><th>账号</th>
+        <th>时间</th><th>#</th><th>来源</th><th>模型</th><th>模式</th><th>思考</th><th>状态</th><th>账号</th>
         <th>TTFB</th><th>tok</th><th>tok/s</th><th>缓存</th><th>耗时</th><th>扣费</th>
       </tr></thead><tbody></tbody>
     </table></div>
@@ -130,6 +145,7 @@ const REFRESH_MS = 5000;
 const HISTORY_MAX = 120;           // 面板侧滚动历史（10 分钟 @5s），用于趋势曲线
 const history = { cache: [], ttfb: [], tps: [] };
 let lastStats = null;
+let lastCatalog = null;            // /v1/models 快照（模型目录 + 促销活动）
 let timer = null, countdown = 0, refreshing = false;
 let serverOffsetMs = 0;            // 网关服务器时间 − 浏览器时间（每次刷新校准）
 
@@ -200,15 +216,17 @@ async function refresh() {
   refreshing = true;
   const errors = [];
   try {
-    const [stats, status, logs] = await Promise.all([
+    const [stats, status, logs, catalog] = await Promise.all([
       getJSON("/api/stats").catch(e => { errors.push("统计: " + e.message); return null; }),
       getJSON("/api/status").catch(e => { errors.push("账号池: " + e.message); return null; }),
       getJSON("/api/logs?limit=100").catch(e => { errors.push("日志: " + e.message); return null; }),
+      getJSON("/api/models").catch(e => { errors.push("模型目录: " + e.message); return null; }),
     ]);
     renderErrors(errors);
     if (stats) { lastStats = stats; renderStats(stats); }
     if (status) renderStatus(status);
     if (logs) renderLogs(logs);
+    if (catalog) { lastCatalog = catalog; renderCatalog(catalog); }
   } finally {
     countdown = REFRESH_MS / 1000;
     refreshing = false;
@@ -317,6 +335,86 @@ function renderModels(models, now) {
   }).join("");
 }
 
+// ── 模型目录 / 限时活动 ────────────────────────────────────────────────
+// 数据源：网关 /v1/models（经面板 /api/models 代理）。每条模型的 promotions[]
+// 来自上游 /v3/config 的 modelPromotions：label/color（标签）、factor（折扣）、
+// valid_until（截止时间）、daily（每日时段，如夜间免费）、text（人类可读说明）。
+function nowMs() { return Date.now() + serverOffsetMs; }
+
+// isPromoLive 过滤已过截止时间的活动（保留生效中 / 未开始 / 无截止的每日时段型）。
+function isPromoLive(p) {
+  if (p.valid_until) {
+    const t = Date.parse(p.valid_until);
+    if (!isNaN(t) && t <= nowMs()) return false;
+  }
+  return true;
+}
+
+// dedupePromos 同一标签（label+color）的多条活动只保留一条（如 glm-5.2 的两条互补
+// 夜间时段活动同标签），优先保留当前生效的那条，避免面板重复展示同一活动。
+function dedupePromos(promos) {
+  const byLabel = new Map();
+  for (const p of promos) {
+    const key = (p.label || p.kind || "") + "|" + (p.color || "");
+    const cur = byLabel.get(key);
+    if (!cur || (!cur.active && p.active)) byLabel.set(key, p);
+  }
+  return [...byLabel.values()];
+}
+
+function promoPill(p) {
+  const label = esc(p.label || p.kind || "活动");
+  if (!p.color) return `<span class="pill muted">${label}</span>`;
+  const color = esc(p.color);
+  return `<span class="pill" style="color:${color};border-color:${color};background:${color}22">${label}</span>`;
+}
+
+function fmtPromoDeadline(p) {
+  const status = p.active ? "生效中" : "未生效";
+  if (p.valid_until) {
+    const t = Date.parse(p.valid_until);
+    if (isNaN(t)) return status;
+    const when = new Date(t).toLocaleString("zh-CN", { hour12: false });
+    const d = t - nowMs();
+    if (d <= 0) return `${when} · 已结束`;
+    return `${status} · ${when} · 剩 ${fmtDur(d / 1000)}`;
+  }
+  if (p.daily && p.daily.length) {
+    return status + " · " + p.daily.map(w => "每日 " + esc(w.start) + "–" + esc(w.end)).join("；");
+  }
+  return status;
+}
+
+function renderCatalog(snap) {
+  const data = snap.data || [];
+  const withPromo = data.filter(m => dedupePromos((m.promotions || []).filter(isPromoLive)).length > 0);
+  const onlyPromo = document.getElementById("promoOnly").checked;
+  const rows = onlyPromo ? withPromo : data;
+  document.getElementById("catalogMeta").textContent =
+    `共 ${data.length} 个模型 · 有活动 ${withPromo.length} 个`;
+  const tb = document.querySelector("#catalog tbody");
+  if (!rows.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">暂无数据</td></tr>';
+    return;
+  }
+  tb.innerHTML = rows.map(m => {
+    const promos = dedupePromos((m.promotions || []).filter(isPromoLive));
+    const credits = m.credits ? esc(m.credits) : "-";
+    const promoCell = promos.length ? promos.map(promoPill).join(" ") : "-";
+    const deadlineCell = promos.length ? promos.map(fmtPromoDeadline).join("<br>") : "-";
+    const textCell = promos.length
+      ? (promos.map(p => esc(p.text || "")).filter(Boolean).join("<br>") || "-")
+      : "-";
+    return `<tr>
+      <td class="mono">${esc(m.id)}</td>
+      <td>${credits}</td>
+      <td>${promoCell}</td>
+      <td>${deadlineCell}</td>
+      <td>${textCell}</td>
+    </tr>`;
+  }).join("");
+}
+
 // ── 账号池 ──────────────────────────────────────────────────────────────
 // renderModelLimits 账号级健康、但个别模型被 6004 独立冷却时的展示（rate_limited_models）。
 // 账号整体仍可选（其它模型照常出号），所以「状态」列仍是健康；限流单独一列，避免
@@ -387,7 +485,7 @@ function renderLogs(snap) {
     `缓冲 ${snap.count}/${snap.capacity} · 累计 ${num(snap.total)}`;
   const entries = snap.entries || [];
   const tb = document.querySelector("#logs tbody");
-  if (!entries.length) { tb.innerHTML = '<tr><td colspan="12" class="empty">暂无请求</td></tr>'; return; }
+  if (!entries.length) { tb.innerHTML = '<tr><td colspan="14" class="empty">暂无请求</td></tr>'; return; }
   const now = lastStats && lastStats.now ? new Date(lastStats.now) : new Date();
   tb.innerHTML = entries.map(e => {
     const t = new Date(e.time);
@@ -403,8 +501,10 @@ function renderLogs(snap) {
     return `<tr>
       <td class="mono">${hhmmss}</td>
       <td class="mono">#${e.seq}</td>
+      <td>${e.source ? `<span class="pill src">${esc(e.source)}</span>` : '-'}</td>
       <td class="mono">${esc(e.model)}</td>
       <td>${esc(e.mode)}</td>
+      <td>${e.reasoning_effort ? esc(e.reasoning_effort) : '<span class="pill muted">未传</span>'}</td>
       <td><span class="pill ${statusCls}">${e.status}</span></td>
       <td>${account}</td>
       <td>${e.ttfb_ms ? e.ttfb_ms + "ms" : "-"}</td>
@@ -452,6 +552,9 @@ function tick() {
 }
 
 document.getElementById("refresh").addEventListener("click", refresh);
+document.getElementById("promoOnly").addEventListener("change", () => {
+  if (lastCatalog) renderCatalog(lastCatalog);
+});
 updateClock();
 refresh();
 timer = setInterval(tick, 1000);

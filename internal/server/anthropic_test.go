@@ -592,3 +592,28 @@ func TestAnthropicToolResultImagePreserved(t *testing.T) {
 		t.Errorf("纯文本 tool_result 应为字符串, got %v", m0["content"])
 	}
 }
+
+// TestEffortForBudget 边界回归：pi 的 high 档 budget_tokens 正好是 16384，
+// 必须落到 high（历史 bug：`<= 16384 → medium` 把 high 误判成 medium，
+// 实测「改成 high 后网关仍打 medium -> high」）。
+func TestEffortForBudget(t *testing.T) {
+	cases := []struct {
+		budget int
+		want   string
+	}{
+		{0, "medium"},     // 缺省（thinking enabled 无 budget）
+		{1024, "low"},     // pi minimal
+		{2048, "low"},     // pi low
+		{4096, "low"},     // 旧上界
+		{8192, "medium"},  // pi medium
+		{9000, "medium"},  // 旧测试口径
+		{16383, "medium"}, // high 前一位仍是 medium
+		{16384, "high"},   // pi high（回归点）
+		{32768, "high"},   // 更大 budget
+	}
+	for _, c := range cases {
+		if got := effortForBudget(c.budget); got != c.want {
+			t.Errorf("effortForBudget(%d) = %q, want %q", c.budget, got, c.want)
+		}
+	}
+}
