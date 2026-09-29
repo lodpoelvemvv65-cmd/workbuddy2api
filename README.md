@@ -494,6 +494,13 @@ env_key = "WB2A_API_KEY"          # 环境变量里放网关 api_key
 `reasoning.effort` 为空时**不开思考**：Codex 常发 `{"summary":"auto"}`，那只表示
 「要不要回传思考摘要」，不是「要不要思考」——见到 `reasoning` 就开思考会让每个请求平白变慢。
 
+`reasoning.summary` 只有显式 `auto/concise/detailed` 才回传思考摘要；缺省（字段缺失/空）
+与 `"none"` 一律抑制，但 effort 照常开思考。上游只产一份 `reasoning_content`，网关照客户端
+意愿决定是否翻成 `reasoning` 条目 / `reasoning_summary_text.*` 事件。这条对 codex 尤其关键：
+它对**自定义模型**（模型元数据缺失、回落 fallback metadata）根本不发 `summary` 字段
+（实测 0.155.1 只发 `{"effort":"xhigh"}`），旧版网关无条件把 `reasoning_content` 当摘要回传，
+于是 TUI 状态行被摘要末行顶掉，`model_reasoning_summary=none` 也无效。
+
 响应侧翻译：非流式给单个 `response` resource；流式给完整事件序列
 `response.created` → `response.in_progress` → 每个条目一组
 `output_item.added` / `content_part.added` / `output_text.delta`… / `content_part.done` /

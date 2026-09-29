@@ -58,6 +58,10 @@ type responsesMeta struct {
 	Stream bool
 	// InputEstimate 出站 body 的粗略输入 token 估算，供流首帧 usage.input_tokens。
 	InputEstimate int
+	// SuppressReasoning 不回传思考摘要。reasoning.summary 未显式要求
+	// auto/concise/detailed 时均为真（含字段缺失、空串、"none"）。只影响是否把
+	// 上游 reasoning_content 翻成 reasoning 条目，不影响出站 thinking。
+	SuppressReasoning bool
 }
 
 // responsesRequest Responses 请求体（只声明本层需要翻译的字段）。
@@ -167,6 +171,7 @@ func responsesToOpenAI(body []byte, defaultModel string) ([]byte, responsesMeta,
 		out["response_format"] = rf
 	}
 	applyResponsesReasoning(out, req.Reasoning)
+	meta.SuppressReasoning = responsesSuppressReasoning(req.Reasoning)
 	// 缓存契约：客户端自带 prompt_cache_key 时**原样透传**（绝不改写）。
 	// codex 的取值是会话 uuid，一条字段同时喂饱会话粘性（session.ExtractKey 的
 	// prompt_cache_key 兜底）与上游缓存键（upstream.InjectPromptCacheKey 优先级 1
@@ -501,6 +506,25 @@ func applyResponsesReasoning(out map[string]any, r *responsesReasoning) {
 	out["reasoning_effort"] = e
 }
 
+// responsesSuppressReasoning 客户端是否要求回传思考摘要。
+//
+// 只有显式 auto/concise/detailed 才回传；字段缺失、空串、"none" 一律抑制。
+// 依据：Responses 协议里 reasoning.summary 是可选字段，缺省即「不要摘要」；
+// 而 codex 对**自定义模型**（模型元数据缺失、回落 fallback metadata）根本不发该
+// 字段——实测 codex 0.155.1 对 deepseek-flash 只发 {"effort":"xhigh"}。旧实现
+// 无条件把上游 reasoning_content 当摘要回传，于是 TUI 状态行被摘要末行顶掉，
+// 客户端设 model_reasoning_summary=none 也无济于事（codex 压根没发这个字段）。
+func responsesSuppressReasoning(r *responsesReasoning) bool {
+	if r == nil {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Summary)) {
+	case "auto", "concise", "detailed":
+		return false
+	}
+	return true
+}
+
 // responsesEffort Responses 档位 → 上游档位（上游认 low/medium/high）。
 func responsesEffort(e string) string {
 	switch strings.ToLower(strings.TrimSpace(e)) {
@@ -634,7 +658,7 @@ func openAIToResponses(resp map[string]any, meta responsesMeta) map[string]any {
 	if choices, ok := resp["choices"].([]any); ok && len(choices) > 0 {
 		if c, ok := choices[0].(map[string]any); ok {
 			if msg, ok := c["message"].(map[string]any); ok {
-				if rc := strAny(msg["reasoning_content"]); rc != "" {
+				if rc := strAny(msg["reasoning_content"]); rc != "" && !meta.SuppressReasoning {
 					out = append(out, responsesReasoningItem("rs_"+session.NewMessageID(), rc))
 				}
 				if text := responsesTextOf(msg["content"]); text != "" {
@@ -1098,7 +1122,7 @@ func (s *respStream) frame(payload string) {
 		return
 	}
 	if d, ok := c["delta"].(map[string]any); ok {
-		if rc := strAny(d["reasoning_content"]); rc != "" {
+		if rc := strAny(d["reasoning_content"]); rc != "" && !s.meta.SuppressReasoning {
 			s.openReasoning()
 			s.reasonBuf.WriteString(rc)
 			s.emit("response.reasoning_summary_text.delta", map[string]any{

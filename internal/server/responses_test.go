@@ -186,6 +186,79 @@ func TestResponsesReasoningSummaryAloneDoesNotEnableThinking(t *testing.T) {
 	}
 }
 
+// TestResponsesReasoningSummaryNoneSuppressed 显式 summary=="none" 时，上游
+// reasoning_content 不得翻成 reasoning 条目（非流式），且不得关闭出站思考。
+// 场景：codex model_reasoning_effort=xhigh（保留强度）+ model_reasoning_summary=none
+// （不想让 TUI 把摘要末行当状态行标题）。
+func TestResponsesReasoningSummaryNoneSuppressed(t *testing.T) {
+	out, meta, err := responsesToOpenAI(
+		[]byte(`{"model":"m","reasoning":{"effort":"xhigh","summary":"none"},"input":"hi"}`), "m")
+	if err != nil {
+		t.Fatalf("translate: %v", err)
+	}
+	var obj map[string]any
+	_ = json.Unmarshal(out, &obj)
+	if _, ok := obj["thinking"]; !ok {
+		t.Errorf("summary=none 不得关闭思考: %v", obj)
+	}
+	if !meta.SuppressReasoning {
+		t.Errorf("meta.SuppressReasoning = false, want true")
+	}
+
+	resp := map[string]any{"choices": []any{map[string]any{"message": map[string]any{
+		"role": "assistant", "content": "hi", "reasoning_content": "secret",
+	}}}}
+	got := openAIToResponses(resp, meta)
+	items, _ := got["output"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("output 条数 = %d, want 1（仅 message，无 reasoning）: %v", len(items), items)
+	}
+	for _, it := range items {
+		if m, _ := it.(map[string]any); m["type"] == "reasoning" {
+			t.Errorf("summary=none 不应出现 reasoning 条目: %v", it)
+		}
+	}
+}
+
+// TestResponsesSummaryNotNoneKeepsReasoning 缺省 / auto 保持原行为（回传摘要）——
+// 防止上面那个开关手滑写成「只要带 summary 就抑制」。
+func TestResponsesSummaryNotNoneKeepsReasoning(t *testing.T) {
+	for _, s := range []string{`"auto"`, `"concise"`, `"detailed"`} {
+		_, meta, err := responsesToOpenAI(
+			[]byte(`{"model":"m","reasoning":{"effort":"high","summary":`+s+`},"input":"hi"}`), "m")
+		if err != nil {
+			t.Fatalf("translate(%s): %v", s, err)
+		}
+		if meta.SuppressReasoning {
+			t.Errorf("summary=%s 不应抑制摘要", s)
+		}
+	}
+}
+
+// TestResponsesReasoningSummaryAbsentSuppressed codex 对自定义模型实测只发
+// {"effort":"xhigh"}（无 summary 字段）——这正是状态行被摘要顶掉的真实形态，
+// 必须默认抑制。
+func TestResponsesReasoningSummaryAbsentSuppressed(t *testing.T) {
+	for _, body := range []string{
+		`{"model":"m","reasoning":{"effort":"xhigh"},"input":"hi"}`,
+		`{"model":"m","reasoning":{"effort":"xhigh","summary":""},"input":"hi"}`,
+		`{"model":"m","reasoning":{"effort":"xhigh","summary":"none"},"input":"hi"}`,
+	} {
+		out, meta, err := responsesToOpenAI([]byte(body), "m")
+		if err != nil {
+			t.Fatalf("translate(%s): %v", body, err)
+		}
+		var obj map[string]any
+		_ = json.Unmarshal(out, &obj)
+		if _, ok := obj["thinking"]; !ok {
+			t.Errorf("%s 应仍开思考: %v", body, obj)
+		}
+		if !meta.SuppressReasoning {
+			t.Errorf("%s 应抑制摘要回传", body)
+		}
+	}
+}
+
 // TestResponsesUsageIncludesCached Responses 的 input_tokens 是**含缓存**总额
 // （与 Anthropic 的剔除法相反）——照抄 anthropicUsage 会让客户端上下文统计偏小。
 func TestResponsesUsageIncludesCached(t *testing.T) {
@@ -281,7 +354,7 @@ func TestResponsesEndpointStream(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
-		`{"model":"deepseek-v4.1-flash","stream":true,"input":"hi"}`))
+		`{"model":"deepseek-v4.1-flash","stream":true,"reasoning":{"summary":"auto"},"input":"hi"}`))
 	req.Header.Set("Authorization", "Bearer ")
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -320,6 +393,32 @@ func TestResponsesEndpointStream(t *testing.T) {
 	// usage：input_tokens 含缓存（100），cached 单列。
 	if !strings.Contains(body, `"input_tokens":100`) || !strings.Contains(body, `"cached_tokens":80`) {
 		t.Errorf("completed 应带含缓存的 usage:\n%s", body)
+	}
+}
+
+// TestResponsesEndpointStreamSummaryNone end-to-end：summary=none 时流式全程无
+// reasoning 摘要事件，但正文与收尾照常——即 codex TUI 拿不到可当状态行标题的文字。
+func TestResponsesEndpointStreamSummaryNone(t *testing.T) {
+	withChatLog(t)
+	up, _ := captureUpstream(t, 200, responsesSSE(
+		`data: {"id":"c1","choices":[{"index":0,"delta":{"reasoning_content":"why "},"finish_reason":null}]}`,
+		`data: {"id":"c1","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}`,
+	), true)
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/responses", strings.NewReader(
+		`{"model":"deepseek-v4.1-flash","stream":true,"reasoning":{"effort":"xhigh","summary":"none"},"input":"hi"}`))
+	req.Header.Set("Authorization", "Bearer ")
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("code = %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "reasoning_summary") || strings.Contains(body, `"type":"reasoning"`) {
+		t.Errorf("summary=none 不得出现 reasoning 摘要事件/条目:\n%s", body)
+	}
+	if !strings.Contains(body, `"delta":"hi"`) || !strings.Contains(body, "event: response.completed") {
+		t.Errorf("正文与收尾必须照常:\n%s", body)
 	}
 }
 
