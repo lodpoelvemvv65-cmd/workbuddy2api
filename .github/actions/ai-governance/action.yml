@@ -14,6 +14,14 @@ inputs:
     description: '治理身份令牌：传入 claude-identity 换票步骤的输出（runner OIDC 向 Anthropic 换来的 Claude App installation token），治理写操作以 claude[bot] 署名；缺省回落 github-token（github-actions[bot]）'
     required: false
     default: ''
+  issue-number:
+    description: 'workflow_dispatch 人工重跑：目标 issue 编号（与 pr-number 二选一；填成 PR 编号会被自动识别为 PR）'
+    required: false
+    default: ''
+  pr-number:
+    description: 'workflow_dispatch 人工重跑：目标 PR 编号（与 issue-number 二选一）'
+    required: false
+    default: ''
   ai-model:
     description: 'AI 模型名'
     required: false
@@ -30,6 +38,10 @@ inputs:
     description: 'OpenAI 兼容 API 类型：chat-completions 或 responses'
     required: false
     default: 'chat-completions'
+  ai-extra-params:
+    description: '透传给模型端点的额外请求体字段（JSON 对象）。用于关掉/压低推理模型的思考 —— 思考 token 与正文共享 max_tokens 预算，思考过长会导致正文为空、整条治理 fail-open。例：{"thinking":{"type":"disabled"}}（该网关支持）或 {"reasoning_effort":"minimal"}'
+    required: false
+    default: ''
   labels:
     description: '逗号分隔的分类标签（对齐仓库 label 体系）'
     required: false
@@ -117,6 +129,14 @@ inputs:
     description: '筛选阶段专用模型（可选，缺省用 ai-model；可配置更廉价的模型）'
     required: false
     default: ''
+  enable-auto-approve:
+    description: '自动合并开关：开启后，通过确定性闸门（分层检测 KEEP + 无敏感路径 + 规模上限）的 PR 会被打上 ai-approved 标签，由仓库原生 auto-merge 在 CI 通过后以 squash 合并（默认关闭）'
+    required: false
+    default: 'false'
+  auto-approve-label:
+    description: '自动合并批准标签名（默认 ai-approved）'
+    required: false
+    default: 'ai-approved'
 
 runs:
   using: 'composite'
@@ -139,6 +159,8 @@ runs:
         node src/index.js
       env:
         INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+        INPUT_ISSUE_NUMBER: ${{ inputs.issue-number }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_GOVERNANCE_TOKEN: ${{ inputs.governance-token }}
         INPUT_AI_MODEL: ${{ inputs.ai-model }}
         INPUT_LABELS: ${{ inputs.labels }}
@@ -149,6 +171,7 @@ runs:
         INPUT_AI_BASE_URL: ${{ inputs.ai-base-url }}
         INPUT_AI_API_KEY: ${{ inputs.ai-api-key }}
         INPUT_AI_API_TYPE: ${{ inputs.ai-api-type }}
+        INPUT_AI_EXTRA_PARAMS: ${{ inputs.ai-extra-params }}
         INPUT_CANONICAL_LABEL: ${{ inputs.canonical-label }}
         INPUT_DUPLICATE_LABEL: ${{ inputs.duplicate-label }}
         INPUT_SKIP_USERS: ${{ inputs.skip-users }}
@@ -165,3 +188,5 @@ runs:
         INPUT_ENABLE_TWO_STAGE: ${{ inputs.enable-two-stage }}
         INPUT_MAX_SCREENED_CANDIDATES: ${{ inputs.max-screened-candidates }}
         INPUT_SCREENING_MODEL: ${{ inputs.screening-model }}
+        INPUT_ENABLE_AUTO_APPROVE: ${{ inputs.enable-auto-approve }}
+        INPUT_AUTO_APPROVE_LABEL: ${{ inputs.auto-approve-label }}

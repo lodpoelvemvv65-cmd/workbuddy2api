@@ -199,6 +199,8 @@ func main() {
 		ActivityReportCount: cfg.Schedule.ActivityReportCount,
 		// 触发时刻抖动窗口（schedule.jitter_minutes，0 = 精确整点 = 旧行为）。
 		JitterMinutes:      cfg.Schedule.JitterMinutes,
+		// 实例盐（schedule.jitter_salt，缺省空 = 与引入前逐字一致）。
+		JitterSalt: cfg.Schedule.JitterSalt,
 		ExpiringSoonWindow: cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
 		// 任务执行台账与当日失败重试（schedule.ledger_file / retry_*）。
 		// 重试默认关闭（RetryDelayMinutes=0），台账恒在（纯内存，除非给了落盘路径）。

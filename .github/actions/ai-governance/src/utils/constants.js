@@ -100,6 +100,10 @@ const GOVERNANCE_DEFAULTS = {
   enableTwoStage: false,
   maxScreenedCandidates: 5,
   screeningModel: '',
+  // 自动合并（ai-approved 标签 + 仓库原生 auto-merge）：默认关闭，需显式开启；
+  // 资格由 mergeAppraisal 的确定性闸门决定（敏感路径一票否决、规模上限、清单可得性）
+  enableAutoApprove: false,
+  autoApproveLabel: 'ai-approved',
   // 历史语境评审关闭的 PR 的确定性标签（R6/C6）：state_reason 对 PR 不可写，
   // 标签是唯一可查的关闭理由标记（is:label 历史检索口径，供未来筛选阶段做语料信号）
   historyRejectedLabel: 'history-rejected',

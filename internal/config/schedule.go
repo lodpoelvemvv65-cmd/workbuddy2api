@@ -48,6 +48,11 @@ type Schedule struct {
 	// 为什么 0 是"关闭"而不是"回落默认"：它是这里的缺省值本身，也是「保持与引入前
 	// 逐字一致」的开关，不是笔误——与 *_enabled 缺省 true 是两回事。
 	JitterMinutes int `json:"jitter_minutes"`
+	// JitterSalt 实例盐（本机补丁，非上游字段）：参与抖动偏移散列，让**同配置的不同
+	// 部署**错开。上游默认散列种子只有「任务类 + 名义时点」，所有部署在同一任务、
+	// 同一天、同一小时会算出同一个偏移——整点齐发只是被平移成一个固定的新齐发时刻。
+	// 留空 = 与上游逐字一致（保持零行为变化）。
+	JitterSalt string `json:"jitter_salt"`
 	// LedgerFile 任务执行台账落盘路径（空 = 纯内存，默认）。
 	//
 	// 台账记每类任务「最近一轮」的结果（总/成功/幂等成功/失败/跳过、是否全灭）
@@ -90,9 +95,9 @@ func DefaultSchedule() Schedule {
 		CheckinHours:        []int{9, 21},
 		TravelHours:         []int{9, 21},
 		ActivityHours:       []int{10},
-		KeepaliveHours:       []int{22},
-		SchoolHours:          []int{12},
-		CatHours:             []int{1},
+		KeepaliveHours:      []int{22},
+		SchoolHours:         []int{12},
+		CatHours:            []int{1},
 		CheckinEnabled:      true,
 		TravelEnabled:       true,
 		ActivityEnabled:     true,

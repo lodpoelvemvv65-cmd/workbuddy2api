@@ -111,7 +111,9 @@ const GOV_INPUTS = [
   { input: 'max-history-index', env: 'INPUT_MAX_HISTORY_INDEX', key: 'max_history_index', out: 'maxHistoryIndex', type: 'int' },
   { input: 'enable-two-stage', env: 'INPUT_ENABLE_TWO_STAGE', key: 'enable_two_stage', out: 'enableTwoStage', type: 'boolean' },
   { input: 'max-screened-candidates', env: 'INPUT_MAX_SCREENED_CANDIDATES', key: 'max_screened_candidates', out: 'maxScreenedCandidates', type: 'int' },
-  { input: 'screening-model', env: 'INPUT_SCREENING_MODEL', key: 'screening_model', out: 'screeningModel', type: 'string' }
+  { input: 'screening-model', env: 'INPUT_SCREENING_MODEL', key: 'screening_model', out: 'screeningModel', type: 'string' },
+  { input: 'enable-auto-approve', env: 'INPUT_ENABLE_AUTO_APPROVE', key: 'enable_auto_approve', out: 'enableAutoApprove', type: 'boolean' },
+  { input: 'auto-approve-label', env: 'INPUT_AUTO_APPROVE_LABEL', key: 'auto_approve_label', out: 'autoApproveLabel', type: 'string' }
 ];
 
 /**
@@ -200,7 +202,9 @@ function parseInputs(config) {
     maxHistoryIndex,
     enableTwoStage,
     maxScreenedCandidates,
-    screeningModel
+    screeningModel,
+    enableAutoApprove,
+    autoApproveLabel
   } = govInputs;
 
   const skipUsersInput = core.getInput('skip-users') || process.env.INPUT_SKIP_USERS || '';
@@ -227,6 +231,31 @@ function parseInputs(config) {
   config.ai_settings.max_files_to_analyze = maxFilesToAnalyze;
   config.ai_settings.max_patch_lines_per_file = maxPatchLinesPerFile;
   config.ai_settings.api_type = aiApiType;
+
+  // ai-extra-params：透传给模型端点的额外请求体字段（JSON 对象）。
+  //
+  // 为什么需要：推理模型的思考 token 与正文**共享 max_tokens 预算**。实测某网关的 deepseek
+  // 系模型在思考较长时会把整个预算吃光、正文返回空串，callAI 随即抛「AI response did not
+  // contain text output」，整条治理 fail-open 放行；而且把上限调得越大反而越糟
+  // （cap=8000 时 100% 被思考吃光）。关掉/压低思考即可根治，同时显著降本降延迟：
+  //   {"thinking":{"type":"disabled"}}    → 思考 0 token（该网关支持）
+  //   {"reasoning_effort":"minimal"}       → 标准 OpenAI 兼容字段，思考压到最小
+  // 解析失败直接报错，不静默忽略配置。
+  const aiExtraParamsRaw = core.getInput('ai-extra-params') || process.env.INPUT_AI_EXTRA_PARAMS || '';
+  let aiExtraParams = {};
+  if (aiExtraParamsRaw.trim() !== '') {
+    let parsed;
+    try {
+      parsed = JSON.parse(aiExtraParamsRaw);
+    } catch (error) {
+      throw new Error(`ai-extra-params 必须是合法 JSON 对象：${error.message}`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('ai-extra-params 必须是 JSON 对象（例如 {"thinking":{"type":"disabled"}}）');
+    }
+    aiExtraParams = parsed;
+  }
+  config.ai_settings.extra_params = aiExtraParams;
   
   // 解析标签列表
   const labelsList = labelsInput.split(',').map(label => label.trim()).filter(label => label.length > 0);
@@ -261,6 +290,8 @@ function parseInputs(config) {
     enableTwoStage,
     maxScreenedCandidates,
     screeningModel,
+    enableAutoApprove,
+    autoApproveLabel,
     config
   };
 }

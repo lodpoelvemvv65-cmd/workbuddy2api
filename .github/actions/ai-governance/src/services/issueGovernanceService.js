@@ -7,6 +7,18 @@ const githubOps = require('./github');
 
 const DUPLICATE_PATTERN = /^DUPLICATE\(#?(\d+)\)/i;
 
+// canonical 草稿的标题兜底判据：标题（去掉 [Feature]/[Bug] 前缀后）若只是小节名或过短，
+// 就没有区分度可言，回落到来源内容的标题。
+const SECTION_LIKE_TITLES = new Set([
+  '概述', '背景与要点', '期望行为', '来源', '背景', '方案', '说明', '摘要', '标题', '待办', '任务'
+]);
+const MIN_CANONICAL_TITLE_LENGTH = 6;
+
+function isUsableCanonicalTitle(title) {
+  const bare = String(title || '').replace(/^\[[^\]]*\]\s*/, '').trim();
+  return bare.length >= MIN_CANONICAL_TITLE_LENGTH && !SECTION_LIKE_TITLES.has(bare);
+}
+
 /**
  * 从多态「请求体」统一拆出 title/body，供 issue 与 PR 两条治理链路复用。
  * PR 治理传入 { number, title, body }，issue 治理传入标准 issue 结构（body 可空）。
@@ -164,8 +176,30 @@ class IssueGovernanceService {
         related_history: (relatedHistory || []).slice(0, this.gov.maxScreenedCandidates)
       })
     };
-    const raw = await callAI(this.openai, this.aiModel, request, this.config, '生成规范 issue 评审评论', false);
+    const configForDraft = this.longFormConfig();
+    const raw = await callAI(this.openai, this.aiModel, request, configForDraft, '生成规范 issue 评审评论', false);
     return String(raw || '').trim() || null;
+  }
+
+  /**
+   * 长文生成调用的配置副本：把 max_tokens 抬到至少 4000。
+   *
+   * 推理模型的思考 token 与正文共享 max_tokens 预算（2026-09 实测某网关的 deepseek 系模型）：
+   *   - 评审评论草稿在 1000 下 finish_reason=length，thinking 占 355~781，正文被截成半句；
+   *   - canonical 草稿更极端，thinking 吃满 1000 后正文为空 → callAI 抛
+   *     「AI response did not contain text output」→ 该条 issue 整体 fail-open 放行
+   *     （canonical 建不出来，只留一条「服务不可用」评论）。
+   * 与 prReviewService.draftReviewComment 采用同一处置：只放宽本次调用，不就地改写全局配置
+   * （同一个 config 对象还要给后续调用复用）。
+   */
+  longFormConfig() {
+    return {
+      ...this.config,
+      ai_settings: {
+        ...this.config.ai_settings,
+        max_tokens: Math.max(this.config.ai_settings.max_tokens || 0, 4000)
+      }
+    };
   }
 
   /**
@@ -181,7 +215,7 @@ class IssueGovernanceService {
         key_points: keyPoints
       })
     };
-    const raw = await callAI(this.openai, this.aiModel, request, this.config, '起草规范化 issue', false);
+    const raw = await callAI(this.openai, this.aiModel, request, this.longFormConfig(), '起草规范化 issue', false);
     return this.splitCanonical(raw, issue.title, classification);
   }
 
@@ -192,6 +226,12 @@ class IssueGovernanceService {
     const text = String(raw || '').trim();
     const lines = text.split('\n').map(l => l.trimEnd());
     let title = (lines[0] || '').replace(/^#+\s*/, '').trim() || fallbackTitle;
+    if (!isUsableCanonicalTitle(title)) {
+      // AI 偶尔把小节名或过短串当标题（2026-09 实测产出过「[Feature] 概述」）。canonical
+      // 索引的区分度全靠标题+正文，这种标题会让后续 issue 的归并匹配失准，因此回落到来源标题。
+      core.warning(`canonical 草稿标题不可用（${title}），回落到来源标题：${fallbackTitle}`);
+      title = fallbackTitle || title;
+    }
     if (!/^\[(Feature|Bug|Enhancement)\]/.test(title)) {
       const prefix = /bug|fix/i.test(classification || '') ? '[Bug] ' : '[Feature] ';
       title = prefix + title.replace(/^\[[^\]]*\]\s*/, '');

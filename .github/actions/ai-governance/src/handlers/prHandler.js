@@ -5,6 +5,7 @@ const PrGovernanceService = require('../services/prGovernanceService');
 const PrReviewService = require('../services/prReviewService');
 const { isContentFilterError } = require('../services/ai');
 const { closePR, addComment } = require('../services/github');
+const { approveIfEligible } = require('../services/autoApprove');
 const { GOVERNANCE_DEFAULTS } = require('../utils/constants');
 
 /**
@@ -111,6 +112,11 @@ async function handleNewPR(octokit, openai, context, owner, repo, aiModel, confi
     // 治理层：要点提炼 + canonical 关联（永不关闭 PR）
     const governanceService = new PrGovernanceService(openai, aiModel, config, gov);
     await governanceService.govern(octokit, owner, repo, pr, classification, sharedCtx);
+
+    // 自动合并资格评定（AI 判定 + 确定性闸门）：过闸门才打 ai-approved 标签，
+    // 由 GitHub 原生 auto-merge 在 CI 通过后以 squash 合并（见 .github/workflows/pr-automerge.yml）。
+    // 放在治理之后：历史语境评审关掉的 PR 已在上方 return，绝不会走到这里。
+    await approveIfEligible(octokit, owner, repo, pr, decision, gov, config);
 
   } catch (error) {
     core.error(logMessage(config.logging.pr_process_error, { error: error.message }));

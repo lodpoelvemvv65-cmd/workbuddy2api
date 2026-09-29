@@ -209,6 +209,64 @@ describe('IssueGovernanceService', () => {
     expect(commentCall[4]).toContain('✅ Claude Code 操作日志：');
   });
 
+  test('长文调用的 max_tokens 局部放宽到 4000（推理模型的思考 token 会吃正文预算）', async () => {
+    const config = buildConfig();
+    expect(config.ai_settings.max_tokens).toBe(2000);
+    // 依次: extract(structured) -> well_formed 判定 -> 评审评论生成
+    const openai = makeOpenai([
+      '```json\n{"要点":"a","要做的事":[]}\n```',
+      'WELL_FORMED',
+      '感谢提交……'
+    ]);
+    const gov = new IssueGovernanceService(openai, 'model', config, { dryRun: false }, makeOps({ canonicalItems: [] }));
+
+    await gov.govern({}, 'o', 'r', issue, 'enhancement');
+
+    // 回归锚点（2026-09 实测）：cap=1000 时推理模型 finish_reason=length（thinking 吃掉
+    // 355~781 tokens），评论被截断成半句话，三段结构只剩第一段；长文调用统一抬到 4000。
+    const caps = openai._create.mock.calls.map(call => call[0].max_tokens);
+    expect(caps).toEqual([2000, 2000, 4000]);
+    // 放宽只作用于本次调用的副本，不就地改写全局配置
+    expect(config.ai_settings.max_tokens).toBe(2000);
+  });
+
+  test('canonical 草稿的 max_tokens 同样放宽到 4000（思考 token 吃满预算会返回空正文）', async () => {
+    const config = buildConfig();
+    const draft = [
+      '[Feature] 支持按账号跳过签到',
+      '',
+      '## 概述',
+      '支持把指定账号从签到任务里摘出来。',
+      '',
+      '## 背景与要点',
+      '- 多账号场景下需要临时排除某个账号',
+      '',
+      '## 期望行为',
+      '- 新增 checkin.skip_uids 配置项',
+      '',
+      '## 来源',
+      '- 原始 issue: #22'
+    ].join('\n');
+    // 依次: extract(structured) -> well_formed 判定(NEEDS_NORMALIZE) -> canonical 草稿
+    const openai = makeOpenai([
+      '```json\n{"要点":"跳过签到","要做的事":["新增配置项"]}\n```',
+      'NEEDS_NORMALIZE',
+      draft
+    ]);
+    const gov = new IssueGovernanceService(openai, 'model', config, { dryRun: false }, makeOps({ canonicalItems: [] }));
+
+    const result = await gov.govern({}, 'o', 'r', issue, 'enhancement');
+
+    expect(result).toMatchObject({
+      decision: GOVERNANCE_DECISIONS.NEW_TOPIC,
+      canonicalNumber: 99,
+      closed: true
+    });
+    const caps = openai._create.mock.calls.map(call => call[0].max_tokens);
+    expect(caps).toEqual([2000, 2000, 4000]);
+    expect(config.ai_settings.max_tokens).toBe(2000);
+  });
+
   test('WELL_FORMED 但 AI 评审生成失败：回落固定模板评论，流程不中断', async () => {
     const config = buildConfig();
     // 依次: extract -> well_formed 判定 -> 评审生成抛错
@@ -440,5 +498,29 @@ describe('IssueGovernanceService', () => {
     expect(reviewInput.related_history).toEqual([]);
     const commentCall = ops.addComment.mock.calls.find(c => c[3] === 22);
     expect(commentCall[4]).not.toContain(config.responses.governance_history_reference_note);
+  });
+
+  test('canonical 草稿标题不可用时回落到来源标题（实测产出过「[Feature] 概述」）', () => {
+    const gov = new IssueGovernanceService(makeOpenai([]), 'model', buildConfig(), {}, makeOps());
+    const split = gov.splitCanonical(
+      '[Feature] 概述\n\n## 概述\n支持按账号跳过签到\n\n## 来源\n- 原始 issue: #1',
+      '希望支持按账号跳过签到任务',
+      'enhancement'
+    );
+    expect(split.title).toBe('[Feature] 希望支持按账号跳过签到任务');
+    // 被丢弃的只是那一行标题，正文小节不受影响
+    expect(split.body).toContain('## 概述');
+  });
+
+  test('可用的草稿标题保持原样，并按分类补前缀 / 保留来源前缀', () => {
+    const gov = new IssueGovernanceService(makeOpenai([]), 'model', buildConfig(), {}, makeOps());
+    expect(gov.splitCanonical('[Feature] 支持按账号跳过签到\n\n## 概述\nx', '兜底标题', 'enhancement').title)
+      .toBe('[Feature] 支持按账号跳过签到');
+    // 来源标题自带 [Bug] 前缀时不被再套一层 [Feature]
+    expect(gov.splitCanonical('概述\n\n## 概述\nx', '[Bug] 签到任务崩溃', 'bug').title)
+      .toBe('[Bug] 签到任务崩溃');
+    // 无前缀且标题可用 → 按分类补前缀
+    expect(gov.splitCanonical('支持按账号跳过签到\n\n## 概述\nx', '兜底标题', 'enhancement').title)
+      .toBe('[Feature] 支持按账号跳过签到');
   });
 });

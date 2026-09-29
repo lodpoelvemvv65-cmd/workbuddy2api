@@ -183,8 +183,9 @@
     "analyze_file_changes": true,
     "max_files_to_analyze": 5,
     "max_patch_lines_per_file": 5,
-    "max_tokens": 1000,
-    "temperature": 0.1
+    "max_tokens": 2000,
+    "temperature": 0.1,
+    "extra_params": {}
   },
   "defaults": {
     "ai_model": "openai/gpt-4o",
@@ -208,7 +209,9 @@
     "max_history_index": 100,
     "enable_two_stage": false,
     "max_screened_candidates": 5,
-    "screening_model": ""
+    "screening_model": "",
+    "enable_auto_approve": false,
+    "auto_approve_label": "ai-approved"
   },
   "analysis_depths": {
     "light": {

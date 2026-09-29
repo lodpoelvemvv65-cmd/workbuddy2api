@@ -1,0 +1,93 @@
+# 自动合并的「启用 / 撤销」环节。
+#
+# 为什么单独一个工作流、且用 workflow_run 触发：
+#   AI 治理用 GITHUB_TOKEN 打标签，而 **GITHUB_TOKEN 产生的事件不会再触发新的工作流运行** ——
+#   所以「打了 ai-approved 标签 → 启用 auto-merge」不能靠 labeled 事件串起来，改用
+#   workflow_run（AI 治理运行结束后）来做。顺带把写权限集中在这一个文件里，便于审计：
+#   AI 治理那侧仍然只需要 issues / pull-requests 写权限，不需要 contents 写权限。
+#
+# 两道保险（缺一不可）：
+#   1) 资格闸门在 AI 治理侧（src/services/mergeAppraisal.js）：分层检测 KEEP + 无敏感路径
+#      （CI / 构建 / 依赖 / 脚本）+ 规模上限 + 清单可得，任一不满足就不会有 ai-approved 标签；
+#   2) 真正的合并交给 GitHub 原生 auto-merge —— 它只在 master 分支保护的必需检查
+#      （PR CI / test）通过后执行。本工作流**不直接调 merge API**，只「启用 auto-merge」。
+#
+# 撤销：PR 有新提交（synchronize）就摘掉标签并关闭 auto-merge —— AI 的判定只针对它评审时
+# 的那个 commit，新提交必须重新评审（重跑：Actions → AI Governance → Run workflow，填 pr-number）。
+name: PR Auto-merge
+
+on:
+  workflow_run:
+    workflows: ["AI Governance"]
+    types: [completed]
+  pull_request_target:
+    types: [synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  enable-auto-merge:
+    if: github.event_name == 'workflow_run'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge for every open ai-approved PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ai-approved
+        run: |
+          set -uo pipefail
+          # 扫全部带标签的开放 PR（幂等）：无论标签是本次 opened 事件打的、还是维护者用
+          # workflow_dispatch 重跑时打的，都会被这里收敛到「已启用 auto-merge」。
+          LABELED=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open --label "$LABEL" \
+            --json number --jq '.[].number')
+          if [ -z "$LABELED" ]; then
+            echo "没有带 $LABEL 的开放 PR，跳过"
+            exit 0
+          fi
+          for PR in $LABELED; do
+            READ=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+              --json isDraft,autoMergeRequest --jq '"\(.isDraft) \(if .autoMergeRequest then "on" else "off" end)"')
+            DRAFT=$(echo "$READ" | cut -d' ' -f1)
+            AUTO=$(echo "$READ" | cut -d' ' -f2)
+            if [ "$DRAFT" = "true" ]; then
+              echo "PR #$PR 是草稿，跳过"
+              continue
+            fi
+            if [ "$AUTO" = "on" ]; then
+              echo "PR #$PR 已启用 auto-merge，跳过"
+              continue
+            fi
+            if gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --squash --auto; then
+              echo "PR #$PR 已启用 auto-merge（等 CI 通过）"
+              printf '%s\n\n%s\n' \
+                "🤖 已通过 AI 自动合并闸门，并启用 auto-merge：**CI（PR CI / test）通过后将以 squash 合并**。" \
+                "闸门条件：分层检测 KEEP（非垃圾 / 标题规范 / 质量 VALID）+ 改动不含 CI、构建、依赖、脚本类文件 + 规模在上限内。**有新提交会自动撤销批准**，需重新评审；维护者如需叫停，摘掉 \`$LABEL\` 标签并关闭 auto-merge 即可。" \
+                | gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file - || true
+            else
+              echo "::warning::PR #$PR 启用 auto-merge 失败（可能仓库未开启 Allow auto-merge，或分支保护未配必需检查）"
+            fi
+          done
+
+  revoke-on-new-commit:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Revoke approval after new commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ai-approved
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          if ! gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name' | grep -qx "$LABEL"; then
+            echo "PR #$PR 没有 $LABEL，无需撤销"
+            exit 0
+          fi
+          gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label "$LABEL" || echo "::warning::移除标签失败"
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto || echo "（auto-merge 本就未启用）"
+          echo "PR #$PR 已撤销批准（新提交需要重新评审）"
+          printf '%s\n' \
+            "🤖 检测到新提交：已撤销 \`$LABEL\` 批准并关闭 auto-merge。AI 的判定只针对它评审时的那个 commit，新提交需要重新评审（维护者可用 Actions → AI Governance → Run workflow 填 \`pr-number\` 触发重跑）。" \
+            | gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file - || true

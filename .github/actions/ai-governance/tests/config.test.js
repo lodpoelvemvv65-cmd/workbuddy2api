@@ -126,6 +126,32 @@ describe('configuration', () => {
       expect(result.maxScreenedCandidates).toBe(5);
       expect(result.screeningModel).toBe('cheap-model');
     });
+    test('自动合并开关与标签名同样经 parseInputs 透出（曾因漏透出而静默失效）', () => {
+      const fallback = parseInputs(cloneConfig());
+      expect(fallback.enableAutoApprove).toBe(false);
+      expect(fallback.autoApproveLabel).toBe('ai-approved');
+
+      process.env.INPUT_ENABLE_AUTO_APPROVE = 'true';
+      process.env.INPUT_AUTO_APPROVE_LABEL = 'merge-me';
+      const overridden = parseInputs(cloneConfig());
+      expect(overridden.enableAutoApprove).toBe(true);
+      expect(overridden.autoApproveLabel).toBe('merge-me');
+    });
+
+    test('ai-extra-params：合法 JSON 透传到 ai_settings.extra_params，非法直接报错', () => {
+      process.env.INPUT_AI_EXTRA_PARAMS = '{"thinking":{"type":"disabled"}}';
+      expect(parseInputs(cloneConfig()).config.ai_settings.extra_params)
+        .toEqual({ thinking: { type: 'disabled' } });
+
+      process.env.INPUT_AI_EXTRA_PARAMS = '{不是 JSON}';
+      expect(() => parseInputs(cloneConfig())).toThrow('ai-extra-params');
+
+      process.env.INPUT_AI_EXTRA_PARAMS = '["数组不行"]';
+      expect(() => parseInputs(cloneConfig())).toThrow('JSON 对象');
+
+      delete process.env.INPUT_AI_EXTRA_PARAMS;
+      expect(parseInputs(cloneConfig()).config.ai_settings.extra_params).toEqual({});
+    });
   });
 
   describe('loadConfig / validateConfig（R15 顺手补测）', () => {

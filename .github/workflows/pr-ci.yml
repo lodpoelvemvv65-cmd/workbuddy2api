@@ -1,0 +1,42 @@
+# PR 测试门禁 —— 这是自动合并的前提，不是可选项。
+#
+# 为什么必须有：仓库此前在 PR 上不跑任何测试。#3 那种「测试全绿、功能却从未生效」的改动
+# 就是这样溜进 master 的（它的测试把错误的 GET 断言成了正确契约，直到 #11 才发现）。
+# 自动合并不能建在没有测试门禁的地基上 —— 否则 AI 的判定就是唯一闸门。
+#
+# master 的分支保护把本工作流的 test 检查列为必需，原生 auto-merge 才会等它通过再合并。
+name: PR CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一个 PR 的新推送取消上一轮（省 runner，也避免旧结论覆盖新结论）
+  group: pr-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # 检查名就是 job 名；分支保护的必需检查按这个名字匹配，改名要同步改分支保护
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 不加 gofmt 门禁：仓库现有文件并未整体 gofmt 干净，加进来会立刻全红
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...

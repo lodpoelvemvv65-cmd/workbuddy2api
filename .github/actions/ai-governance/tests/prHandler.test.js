@@ -5,10 +5,12 @@ const baseConfig = require('../config.json');
 jest.mock('../src/services/prWorkflowService');
 jest.mock('../src/services/prGovernanceService');
 jest.mock('../src/services/prReviewService');
+jest.mock('../src/services/autoApprove');
 
 const PrWorkflowService = require('../src/services/prWorkflowService');
 const PrGovernanceService = require('../src/services/prGovernanceService');
 const PrReviewService = require('../src/services/prReviewService');
+const { approveIfEligible } = require('../src/services/autoApprove');
 
 function buildConfig() {
   const config = JSON.parse(JSON.stringify(baseConfig));
@@ -82,6 +84,24 @@ describe('prHandler', () => {
     expect(PrWorkflowService).toHaveBeenCalled();
     // 不调用治理
     expect(PrGovernanceService).not.toHaveBeenCalled();
+  });
+
+  test('治理之后执行自动合并评定，并把分层检测结论交给闸门', async () => {
+    approveIfEligible.mockResolvedValue({ eligible: false, reason: '测试' });
+    const config = buildConfig();
+    const pr = makePR();
+    const octokit = makeOctokit();
+    const gov = { ...govDefaults, maintainerExempt: false };
+
+    await handleNewPR(octokit, {}, makeContext(pr), 'o', 'r', 'model', config, ['enhancement'], [], gov);
+
+    expect(PrGovernanceService).toHaveBeenCalled();
+    // gov 会先在 handler 里与 GOVERNANCE_DEFAULTS 合并，因此按字段断言而非对象相等
+    expect(approveIfEligible).toHaveBeenCalledWith(
+      octokit, 'o', 'r', expect.objectContaining({ number: 42 }), 'KEEP',
+      expect.objectContaining({ maintainerExempt: false, canonicalLabel: 'canonical' }),
+      config
+    );
   });
 
   test('跳过名单（bot 自环）：直接返回，不做任何检测与治理', async () => {

@@ -363,6 +363,24 @@ class PrReviewService {
   }
 
   /**
+   * 长文 / 结构化判定的配置副本：把 max_tokens 抬到至少 4000。
+   *
+   * 推理模型的思考 token 与正文共享 max_tokens 预算（2026-09 实测）：cap=1000 时 thinking
+   * 会把预算吃光、正文返回空串，callAI 随即抛「AI response did not contain text output」。
+   * 本服务是 PR 治理链路里最先跑的重活，它一抛错，整条 PR 治理（分类打标、canonical 关联、
+   * 自动合并评定）都会退化成 fail-open 放行 —— 只放宽本次调用，不就地改写全局配置。
+   */
+  longFormConfig() {
+    return {
+      ...this.config,
+      ai_settings: {
+        ...this.config.ai_settings,
+        max_tokens: Math.max(this.config.ai_settings.max_tokens || 0, 4000)
+      }
+    };
+  }
+
+  /**
    * AI 评审：判定 PR 是否与历史结论冲突/重复/已被覆盖。
    * 返回 { decision, reasons, evidence }；输出不可解析时返回 UNCERTAIN（回落）。
    */
@@ -375,7 +393,7 @@ class PrReviewService {
       this.openai,
       this.aiModel,
       request,
-      this.config,
+      this.longFormConfig(),
       'PR 历史语境评审',
       { decision: 'UNCERTAIN', reasons: [], evidence: [] }
     );
@@ -524,7 +542,7 @@ class PrReviewService {
   /**
    * 生成中文评审评论（🤖 前缀 + 尾部操作日志行，与 issueGovernanceService 同约定）。
    * 输入全部是不可信数据，AI 只做「重述 + 评价」，引用的 issue 编号已在 verifyEvidence 校验过真实性。
-   * 评论草稿是多段结构化中文，逐字用默认 max_tokens（1000）容易截断 JSON 导致解析失败，
+   * 评论草稿是多段结构化中文，逐字用默认上限容易截断 JSON 导致解析失败，
    * 这里局部放宽到至少 2000 —— 只影响本次调用，不动全局配置。
    */
   async draftReviewComment(pr, verdict, related) {
@@ -545,13 +563,7 @@ class PrReviewService {
         }))
       })
     };
-    const configForDraft = {
-      ...this.config,
-      ai_settings: {
-        ...this.config.ai_settings,
-        max_tokens: Math.max(this.config.ai_settings.max_tokens || 0, 2000)
-      }
-    };
+    const configForDraft = this.longFormConfig();
     const raw = await callAIStructured(
       this.openai,
       this.aiModel,
