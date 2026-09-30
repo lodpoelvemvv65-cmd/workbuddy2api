@@ -358,9 +358,12 @@ WARN: [server] degenerate repetition acct=xxx(uid8) model=deepseek-v4.1-flash ef
 ```
 
 - 检测恒开、纯观测（不改写/延迟透传字节），每路文本只保留最近 512KB；
-- 想留存原文离线分析，设 `WB2A_DUMP_RESP=1`（或一个显式目录）：把请求体与
-  已累积的思维链/正文落到 `last_request.json` / `last_reasoning.txt` / `last_content.txt`，
-  目录默认 `/app/data`；
+- 想留存原文离线分析：
+  - **免重启（推荐）**：`touch ./data/dump_resp.on` 即开，`rm ./data/dump_resp.on` 即关；
+  - 或环境变量 `WB2A_DUMP_RESP=1`（或一个显式目录，需重启生效）。
+  开启后把请求体与已累积的思维链/正文落到 `last_request.json` / `last_reasoning.txt` /
+  `last_content.txt`，目录默认 `/app/data`（宿主 `./data`）；
+- 单字符分隔线（`───` / `========`）不算复读（误报过滤）；
 - 既有 `WB2A_DUMP_REQ`（≥4MB 请求体落 `last_request.json`）不受影响。
 
 ### 可视化面板（独立进程）

@@ -12,8 +12,10 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-      # 退化重复排障（可选）：设为 1 时把请求体 + 思维链/正文原文落到 ./data/last_*.txt
-      # （模型复读循环时离线分析用；不设则只打 WARN，零落盘）。
+      # 退化重复排障（可选）：开启后把请求体 + 思维链/正文原文落到 ./data/last_*.txt。
+      # 两种开法（等效）：
+      #   - 环境变量（需重启）：取消下面注释；
+      #   - 哨兵文件（免重启，推荐）：touch ./data/dump_resp.on 即开，rm 即关。
       # - WB2A_DUMP_RESP=1
     ports:
       - "7863:7863"

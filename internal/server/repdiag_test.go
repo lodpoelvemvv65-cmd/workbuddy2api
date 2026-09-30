@@ -139,6 +139,37 @@ func TestLogRepetitionFormat(t *testing.T) {
 	t.Logf("实际日志行: %s", strings.TrimSpace(out))
 }
 
+func TestDetectRepeatSeparatorNotFlagged(t *testing.T) {
+	// 分隔线（单字符重复）不应被判为退化复读。
+	seps := []string{
+		strings.Repeat("─", 30),
+		strings.Repeat("=", 32),
+		strings.Repeat(".", 40),
+		strings.Repeat("- ", 20),
+		strings.Repeat("\u3000", 20),
+	}
+	for _, s := range seps {
+		if u, c, ok := detectRepeat([]byte(s)); ok {
+			t.Errorf("分隔线被误报为复读: unit=%q repeats=%d input=%q", u, c, s)
+		}
+	}
+}
+
+func TestUniformUnit(t *testing.T) {
+	if !uniformUnit([]byte("────────")) {
+		t.Error("全横线应为 uniform")
+	}
+	if !uniformUnit([]byte("====")) {
+		t.Error("全等号应为 uniform")
+	}
+	if uniformUnit([]byte("Hmm. Hmm.")) {
+		t.Error("含多种字符不应为 uniform")
+	}
+	if uniformUnit([]byte("\u3000\u3000")) {
+		t.Error("全空白应视为 uniform（排除）")
+	}
+}
+
 // jsonQuote 极简 JSON 字符串转义（测试用，内容仅 ASCII 安全字符）。
 func jsonQuote(s string) string {
 	var b strings.Builder

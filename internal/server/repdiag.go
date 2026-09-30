@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -39,6 +40,11 @@ const (
 	repMinRepeats = 4
 	// repMaxUnit 单元搜索上限：比这更长的"循环"按更短周期识别即可（更具体）。
 	repMaxUnit = 160
+	// dumpSentinelPath 落盘开关的哨兵文件（容器内路径；宿主为 ./data/dump_resp.on）。
+	// 存在即开启落盘——运行中 touch/rm 即可切换，**无需重启**（env 只在启动时读取）。
+	dumpSentinelPath = "/app/data/dump_resp.on"
+	// dumpDefaultDir 默认落盘目录（与既有 WB2A_DUMP_REQ 同口径）。
+	dumpDefaultDir = "/app/data"
 )
 
 // repBuf 有界文本缓冲：追加 + 超限裁剪（批量裁剪，避免每帧都搬移）。
@@ -84,6 +90,9 @@ func detectRepeat(data []byte) (unit string, count int, ok bool) {
 		if len(bytes.TrimSpace(u)) == 0 {
 			continue // 纯空白单元不是退化信号
 		}
+		if uniformUnit(u) {
+			continue // 单一字符重复（─── / ======== / .....）是分隔线，不是退化复读
+		}
 		cnt := 1
 		for j := m - p; j-p >= 0; j -= p {
 			if bytes.Equal(win[j-p:j], u) {
@@ -101,6 +110,30 @@ func detectRepeat(data []byte) (unit string, count int, ok bool) {
 		return "", 0, false
 	}
 	return string(win[m-bestP:]), bestCnt, true
+}
+
+// uniformUnit 判断单元去掉空白后是否只由**同一个字符**组成。
+//
+// 为什么需要：模型画分隔线（`──────`、`========`、`........`）时，算法会把它
+// 当成"3 字节单元 × 10 次"这类重复而误报（实测 `───` 一个字符占 3 字节，
+// 30 个横线就凑够 ≥8 字节单元 × ≥4 次）。这类单字符重复没有退化语义，排除。
+func uniformUnit(u []byte) bool {
+	var first rune
+	seen := false
+	for _, r := range string(u) {
+		if unicode.IsSpace(r) {
+			continue
+		}
+		if !seen {
+			first = r
+			seen = true
+			continue
+		}
+		if r != first {
+			return false
+		}
+	}
+	return seen // 全是空白（seen=false）也视为 uniform，一并排除
 }
 
 // repDiag 单次流式请求的重复诊断累积器。零值可用。
@@ -168,18 +201,27 @@ func (d *repDiag) Hit() (kind, unit string, count, reasonBytes, contentBytes int
 func (d *repDiag) ReasoningText() string { return string(d.reasoning.data) }
 func (d *repDiag) ContentText() string   { return string(d.content.data) }
 
-// dumpRespDir 解析 WB2A_DUMP_RESP 开关：空/false 关闭；1/true/yes/on → 默认目录
-// /app/data（与既有 WB2A_DUMP_REQ 同口径）；其余值当作显式目录。
+// dumpRespDir 解析落盘开关。优先级：环境变量 WB2A_DUMP_RESP > 哨兵文件。
+//   - 环境变量空/false → 再看哨兵文件 /app/data/dump_resp.on 是否存在（运行中可切）；
+//   - 1/true/yes/on → 默认目录 /app/data；
+//   - 其余值 → 当作显式目录。
+//
+// 哨兵文件的意义：env 只在进程启动时读取，而模型复读是偶发的——需要"现在就在抓"
+// 时不必重启网关（重启会掐断在途请求）。touch 一个文件即可开抓。
 func dumpRespDir() string {
 	v := strings.TrimSpace(os.Getenv("WB2A_DUMP_RESP"))
 	switch strings.ToLower(v) {
-	case "", "0", "false", "no", "off":
-		return ""
 	case "1", "true", "yes", "on":
-		return "/app/data"
+		return dumpDefaultDir
+	case "", "0", "false", "no", "off":
+		// 落到哨兵文件判定
 	default:
 		return v
 	}
+	if _, err := os.Stat(dumpSentinelPath); err == nil {
+		return dumpDefaultDir
+	}
+	return ""
 }
 
 // DumpRepetition 把请求体与已累积的思维链/正文落盘（dir 非空时）。写入失败只打
