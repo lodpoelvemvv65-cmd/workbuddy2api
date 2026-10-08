@@ -102,6 +102,21 @@ git status --ignored                             # 看被忽略的敏感文件
 
 ## 7. 备份 / 回退
 
-- 合并前的备份 tag:`backup/pre-merge-upstream-5e2c2b4`(指向上游 5 提交合并之前的 `c58b76b`)。
+- 合并前的备份 tag:`backup/before-merge-20261008_1253`(指向 2026-10-08 合并上游 8 提交之前的 `ddb087d`);更早一次是 `backup/pre-merge-upstream-5e2c2b4`。
 - 回退方式:`git reset --hard <tag>`(丢弃)或 `git revert <commit>`(保留历史)。
-- 确认无需回退后可删备份:`git tag -d backup/pre-merge-upstream-5e2c2b4`。
+- 确认无需回退后可删备份:`git tag -d backup/before-merge-20261008_1253`。
+
+### 2026-10-08 合并教训(上游 auth 分组 / 签到)
+
+上游新增「账号分组隔离 + 密钥分组调用 + 签到」时,与本地特性在同一处叠加,
+`git merge` 报 `cmd/server/main.go`、`internal/server/handler.go` 冲突。经验:
+
+- `main.go`:`metricsJSONPath`(本地)与 `checkinJSONPath`(上游)在同一位置,保留**两个**函数。
+- `handler.go`:`Config` 结构字段、路由注册同样各加各的,两边都保留。
+- **`withAuth` 是语义冲突重点**:上游改成多密钥表(`authKeyTable`/`matchAuthKey`),
+  本地加了 Anthropic 系的 `X-Api-Key` 回落与错误信封按协议分流。合并后:
+  - **保持 `matchAuthKey(keys, authz)` 原签名**(上游测试直接调用,改签名会让 `authkeys_test.go` 编译失败);
+  - 在 `withAuth` 里把非 Bearer 的 `X-Api-Key` 拼成 `Bearer <key>` 再交给 `matchAuthKey`。
+- 粘性号解绑处:本地补的 `acct = nil` 是**必需修复**(realm 不符时不置 nil 会用错域账号),
+  不能因选上游注释而丢掉。
+- 合并后必须跑 `go test ./...` 才能发现上面的 `matchAuthKey` 签名问题。
