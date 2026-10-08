@@ -71,6 +71,17 @@ type Config struct {
 	// LedgerFile 任务执行台账落盘路径。空 = 纯内存（重启后只剩新跑过的记录）。
 	// 台账是观测数据，落盘失败只记日志、不影响任务执行，故不做启动期 fail-fast。
 	LedgerFile string
+
+	// OnCheckinDone 每次全量签到**结束**后的回调（见 CheckinAll 尾部）。
+	//
+	// 为什么挂在 CheckinAll 里而不是各调用点：手动入口（cmd/server 的
+	// checkinReportFn）与定时排程（RunCheckinNow）都走这一个函数，挂钩一处
+	// 即两条路径全覆盖，不会出现「手动签的记了、自动签的没记」这类口径分裂。
+	//
+	// 签名用 []CheckinOutcome 而非 server.CheckinReport：scheduler 不反向 import
+	// server（成环），映射成 HTTP 口径由 cmd/server 的 buildCheckinReport 负责。
+	// started/finished 为本次签到起止时刻。nil = 不落盘（老调用方/测试零改动）。
+	OnCheckinDone func(outcomes []CheckinOutcome, started, finished time.Time)
 }
 
 // Scheduler 调度器。
@@ -461,6 +472,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	}
 	defer s.checkinMu.Unlock()
 
+	started := time.Now()
 	statuses := s.cfg.Pool.List()
 	out := make([]CheckinOutcome, 0, len(statuses))
 	var okN, alreadyN, failN, skipN int
@@ -483,6 +495,14 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
 		// 按 CN 处理——这是 D5 逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
 		if a.IsGlobal() {
+			if a.NeedsRefresh(checkinRefreshSkew) {
+				if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+					s.cfg.Pool.NoteRefreshFail(st.UID, err) // P0-1 续期观测台账（只记录，不判罚）
+					log.Printf("credit-refresh %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
+				} else {
+					s.cfg.Pool.NoteRefreshOK(st.UID) // P0-1：续期链路此刻是活的，留证
+				}
+			}
 			oc.Status, oc.Detail = CheckinSkipped, "global"
 			skipN++
 			out = append(out, oc)
@@ -491,6 +511,7 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		// 停机跨过 token 有效期（关机过夜/容器长期停跑）时先补一次刷新，否则签到必然 401 白跑。
 		if a.NeedsRefresh(checkinRefreshSkew) {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+				s.cfg.Pool.NoteRefreshFail(st.UID, err) // P0-1 续期观测台账（只记录，不判罚）
 				log.Printf("checkin %s refresh: %v", logfmt.Label(st.UID, st.Nickname), err)
 				var ue *upstream.Error
 				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -507,7 +528,8 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 					continue
 				}
 			} else {
-				a.BackfillRealm() // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
+				s.cfg.Pool.NoteRefreshOK(st.UID) // P0-1：续期成功，留证（与失败分支对称）
+				a.BackfillRealm()                // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 				if err := a.SaveAtomic(); err != nil {
 					// 刷新成功但落盘失败：重启会用旧 token，必须暴露。
 					log.Printf("checkin %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
@@ -556,7 +578,37 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 		len(statuses), okN, alreadyN, failN, skipN)
 	// 顺带做一次签到活动到期预警（只读探测，不影响签到结果；见 checkin_activity.go）。
 	s.warnCheckinActivity(statuses)
+	// 结果回调（落盘供控制台回放）：手动入口与定时排程共用此处，两条路径口径一致。
+	// 在锁内执行：落盘期间并发 CheckinAll 拿 ErrBusy，而不是插进「历史写一半」的窗口。
+	// 回调本身不返回错误——落盘失败由实现方记日志，不能因为它让一次成功的签到被
+	// 调用方判成失败（签到是真的打了上游，结果不该被本地 IO 问题抹掉）。
+	if s.cfg.OnCheckinDone != nil {
+		s.cfg.OnCheckinDone(out, started, time.Now())
+	}
 	return out, nil
+}
+
+// CheckinSchedule 返回签到排程的只读快照（enabled / hours / jitter），
+// 供 server 的 GET /v1/checkin/history 透出。实现 server.CheckinScheduleProvider。
+//
+// hours 返回副本：调用方（HTTP handler）不该改到调度器的配置。
+func (s *Scheduler) CheckinSchedule() (enabled bool, hours []int, jitterMinutes int) {
+	hours = append([]int(nil), s.cfg.CheckinHours...)
+	return !s.cfg.CheckinDisabled, hours, s.cfg.JitterMinutes
+}
+
+// NextCheckinAt 返回 now 之后最近的一个自动签到时点；签到排程已禁用时返回零值。
+//
+// 复用 nextFire / jitterOffset 的**同一份**算法：前端只做
+// 「倒计时 = next_fire_at - now」这一件事，不自己复刻 jitter 派生——一旦有人开了
+// jitter_minutes，复刻版会静默算错（且没人会发现，因为差异只有几分钟）。
+func (s *Scheduler) NextCheckinAt(now time.Time) time.Time {
+	if s.cfg.CheckinDisabled {
+		return time.Time{}
+	}
+	// salt 与调度器内部排程点用同一个（s.cfg.JitterSalt），否则「前端倒计时」与
+	// 「实际触发时刻」会算出不同偏移。
+	return nextFire(now, s.cfg.CheckinHours, taskCheckin, s.cfg.JitterMinutes, s.cfg.JitterSalt)
 }
 
 // joinDetail 拼接多段原因，避免后一段覆盖前一段的失败信息。
@@ -851,6 +903,7 @@ func (s *Scheduler) runKeepalive(trigger string) {
 		t.total++
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			t.fail++
+			s.cfg.Pool.NoteRefreshFail(st.UID, err) // P0-1 续期观测台账（只记录，不判罚）
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -861,6 +914,7 @@ func (s *Scheduler) runKeepalive(trigger string) {
 			continue
 		}
 		t.ok++
+		s.cfg.Pool.NoteRefreshOK(st.UID)    // P0-1：续期成功，留证（与失败分支对称）
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		a.BackfillRealm()                   // 老 auth 空 realm → 落盘前补标识（幂等：已有不动）
 		if err := a.SaveAtomic(); err != nil {

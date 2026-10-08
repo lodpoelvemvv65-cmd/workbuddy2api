@@ -36,6 +36,18 @@ func (p *Pool) Pick(model string) *auth.Auth {
 // 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
 // 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pickScoped(tried, reqModel, realm, nil)
+}
+
+// pickScoped 是 pick 的完整实现，在 realm 维度之上再叠加**业务分组**过滤。
+//
+// groups 为空 = 该维度不过滤（主密钥 / 未配置分组的密钥语义）；非空时只保留
+// MatchesGroups(groups) 为真的账号（账号未打标签 → 默认拒绝，语义见
+// auth.Auth.MatchesGroups）。
+//
+// 两个谓词**正交**且 AND 组合：realm 是账号固有的技术域（决定去哪个上游域调），
+// groups 是运维自定义的业务标签（决定哪把密钥能用它）。互不替代、也不互相推导。
+func (p *Pool) pickScoped(tried map[string]bool, reqModel, realm string, groups []string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -46,9 +58,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		e.pruneExpiredModelCosts(now)
 	}
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
-	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
+	groupsOK := func(e *entry) bool { return e.a.MatchesGroups(groups) }
+	healthyOf := func(e *entry) bool { return realmOK(e) && groupsOK(e) && e.healthy(now) }
 	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
+		healthyOf = func(e *entry) bool { return realmOK(e) && groupsOK(e) && e.healthyForModel(now, reqModel) }
 	}
 	var cands []*entry
 	for uid, e := range p.byUID {
@@ -66,7 +79,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm)
+		return p.pickEarliestExpiryLockedScoped(tried, now, realm, groups)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿
 	// 根本进不了短名单决策，低 credits 但久置的账号会永远排不进 top5。
@@ -230,6 +243,16 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm string) *auth.Auth {
+	return p.pickEarliestExpiryLockedScoped(tried, now, realm, nil)
+}
+
+// pickEarliestExpiryLockedScoped 是全冷却兜底的完整实现，额外支持业务分组过滤。
+//
+// ★ 兜底路径必须同受分组约束 ★ 这是最容易漏的一处隔离漏洞：正常路径滤了 groups，
+// 兜底不滤的话，当**本组账号全部进入冷却**时（正是业务高峰或上游风控期），网关会从
+// 其他组"借号"顶上——隔离恰好在本该最可靠的时候失效，且日志上只是一次正常的
+// fallback_earliest_expiry，看不出串组。故此处与 pickScoped 同口径过滤。
+func (p *Pool) pickEarliestExpiryLockedScoped(tried map[string]bool, now time.Time, realm string, groups []string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -237,6 +260,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		if realm != "" && e.a.Realm() != realm {
 			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
+		}
+		if !e.a.MatchesGroups(groups) {
+			continue // 分组过滤：其他密钥分组的冷却账号不参与本组兜底（见函数注释）
 		}
 		if e.disabled || e.manualDisabled {
 			continue // 禁用/手动停用的账号永不参与兜底

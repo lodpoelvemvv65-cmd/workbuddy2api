@@ -2,22 +2,36 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"workbuddy2api/internal/config"
 	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/server"
 )
+
+// APIKeyEntry 一条**分组密钥**（config 的 api_keys 元素）。
+//
+// 语义：请求以本 Key 鉴权时，只在与 Groups 有交集的账号中选号（账号侧标签见
+// auth.Auth.Groups）。Groups 为空 = 不限分组（等价主密钥语义）。
+type APIKeyEntry struct {
+	Key    string   `json:"key"`
+	Name   string   `json:"name"`
+	Groups []string `json:"groups"`
+}
 
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
+	APIKey    string `json:"api_key"`    // 空 = 不鉴权；主密钥，不限分组
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
 	// MetricsFile /v1/stats 请求统计的持久化路径。空 = 派生：与 state_file 同目录的
@@ -34,6 +48,18 @@ type Config struct {
 	// LogMaxMB 日志文件轮转阈值（MB），超过即切一份 .1 备份（只留最近一份）。
 	// <=0 回落默认 64。仅在 log_file 非空时生效。
 	LogMaxMB int `json:"log_max_mb"`
+
+	// APIKeys 分组密钥表：每把密钥可绑定若干**业务分组**，请求命中该密钥时只在与
+	// 这些分组有交集的账号中选号。
+	//
+	// 与 api_key 的关系：api_key 是**主密钥**、语义不变（等价 Groups 为空 = 不限分组，
+	// 排在本表之前参与匹配）；api_keys 是**纯增量**——老部署不配这一段，行为与改动前
+	// 逐字一致（JSON 未知字段对老二进制同样是忽略）。
+	//
+	// ⚠️ 本表的密钥**不得**写入 api_keys_legacy：那张表是给 nginx 做「旧 key 改写成
+	// 当前 key」的别名表。一旦写进去，密钥在入口就被 nginx 改写成主密钥，分组身份当场
+	// 丢失，表现为"分组密钥能拿到全部账号"——隔离静默失效，且从网关日志上完全看不出来。
+	APIKeys []APIKeyEntry `json:"api_keys"`
 
 	Server struct{} `json:"server"` // 已退役段：max_body_mb 移除后无字段；旧配置该段下任意键因 JSON 未知字段而自然忽略
 
@@ -649,6 +675,11 @@ func (c *Config) normalize() error {
 	if err := c.Schedule.Normalize(); err != nil {
 		return err
 	}
+	// 分组密钥表归一并 fail-fast（空密钥 / 非法组名 / 密钥重复）。放在最后：它要用
+	// 主 api_key 的**最终值**（env 覆盖之后）做去重比对。
+	if err := c.normalizeAPIKeys(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
 }
 
@@ -728,6 +759,107 @@ func (c *Config) normalizeAlerting() error {
 // custom/append 模式下 file 非空但不可读 → 报错（fail fast），file 空 → 用内置默认
 // （两模式共用同一加载路径，PromptText 均非空）。
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
+// apiKeyGroupRe 分组名的合法字符集：小写字母/数字开头，其后可含小写字母、数字、下划线、
+// 连字符，总长 ≤32。
+//
+// 为什么要卡大小写与空白：组名要靠"与账号 auth 文件里的 groups **精确相等**"才生效
+// （auth.MatchesGroups 不做大小写折叠）。配置侧宽松的话，一个 "Internal" 会安静地
+// 匹配不到任何标了 "internal" 的账号 —— 表现为"配了分组却一把号都拿不到"，而配置
+// 本身看起来完全正常。故在此 fail-fast，把错误挡在启动期。
+var apiKeyGroupRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+// normalizeAPIKeys 归一并校验 api_keys 段（分组密钥表）。
+//
+// fail-fast 三则（风格同 admin.enabled + 空 api_key：开了功能就必须给齐参数）：
+//  1. key 为空 → 报错。空密钥等于"任何空 Bearer 都能过"，是纯提权而非笔误容错。
+//  2. 组名不合规（见 apiKeyGroupRe）→ 报错（理由见该变量注释）。
+//  3. 密钥指纹重复（**含与主 api_key 重复**）→ 报错。匹配是遍历后取最后一个命中，
+//     重复条目的 groups 绑定会被静默忽略 —— 配了不生效，比配错更难发现。
+//
+// groups 归一：去首尾空白、丢弃空串、按首次出现顺序去重；整段为空切片 = 不限分组
+// （合法语义，不是错误）。空数组与"省略 groups 键"等价。
+func (c *Config) normalizeAPIKeys() error {
+	if len(c.APIKeys) == 0 {
+		return nil
+	}
+	fpSeen := make(map[string]string, len(c.APIKeys)+1) // 指纹 → 人类可读的条目描述
+	if k := strings.TrimSpace(c.APIKey); k != "" {
+		fpSeen[apiKeyFP(k)] = "api_key（主密钥）"
+	}
+	for i := range c.APIKeys {
+		e := &c.APIKeys[i]
+		e.Key = strings.TrimSpace(e.Key)
+		if e.Key == "" {
+			return fmt.Errorf("api_keys[%d].key 为空：空密钥等于放行任何空 Bearer，请填写密钥或删除该条目", i)
+		}
+		e.Name = strings.TrimSpace(e.Name)
+		label := fmt.Sprintf("api_keys[%d]", i)
+		if e.Name != "" {
+			label += "（" + e.Name + "）"
+		}
+		fp := apiKeyFP(e.Key)
+		if prev, dup := fpSeen[fp]; dup {
+			return fmt.Errorf("%s 与 %s 的密钥相同（指纹 %s）：重复密钥会让后者的 groups 绑定被静默忽略",
+				label, prev, fp)
+		}
+		fpSeen[fp] = label
+
+		if len(e.Groups) == 0 {
+			e.Groups = nil
+			continue
+		}
+		norm := make([]string, 0, len(e.Groups))
+		gSeen := make(map[string]bool, len(e.Groups))
+		for _, g := range e.Groups {
+			g = strings.TrimSpace(g)
+			if g == "" {
+				continue
+			}
+			if !apiKeyGroupRe.MatchString(g) {
+				return fmt.Errorf("%s.groups 含非法组名 %q：须匹配 %s（组名要与账号文件的 groups 精确相等才生效，不接受大写与空白）",
+					label, g, apiKeyGroupRe.String())
+			}
+			if gSeen[g] {
+				continue
+			}
+			gSeen[g] = true
+			norm = append(norm, g)
+		}
+		if len(norm) == 0 {
+			norm = nil
+		}
+		e.Groups = norm
+	}
+	return nil
+}
+
+// apiKeyFP 密钥指纹（sha256 前 16 位 hex）。与 nginx 侧的 sync-nginx-key.sh、
+// internal/server 的审计指纹同口径，仅用于去重与日志溯源，**不落明文**。
+func apiKeyFP(k string) string {
+	sum := sha256.Sum256([]byte(k))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// buildAuthKeys 把配置展开成 handler 的鉴权密钥表。
+//
+// 主密钥（cfg.APIKey）排第一且 Groups 为空 = 不限分组，保持"主密钥 = 全权"的既有
+// 语义：既有客户端拿的是同一把 key，行为与改动前逐字一致。
+// 分组密钥随后追加，各自携带自己的可见分组。
+//
+// 两者都为空 → 返回 nil，handler 视作"不鉴权部署"（现状语义）。
+func buildAuthKeys(cfg *Config) []server.AuthKey {
+	// 刻意用 nil 零值切片而非 make(...,0,...)：全空时返回 nil（"无非配置"的干净语义），
+	// 与 handler 侧 len()>0 的判断等价，但避免出现空切片与非 nil 的差异。
+	var out []server.AuthKey
+	if k := strings.TrimSpace(cfg.APIKey); k != "" {
+		out = append(out, server.AuthKey{Key: k, Name: "主密钥"})
+	}
+	for _, e := range cfg.APIKeys {
+		out = append(out, server.AuthKey{Key: e.Key, Name: e.Name, Groups: e.Groups})
+	}
+	return out
+}
+
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
 	case "", "passthrough":

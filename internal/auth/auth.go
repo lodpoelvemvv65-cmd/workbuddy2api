@@ -31,17 +31,35 @@ type Auth struct {
 	//
 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
-	realm          string
-	UID            string
-	EnterpriseID   string
-	Nickname       string
-	FilePath       string // 来源文件；refresh 后原子写回此处
+	realm        string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+	FilePath     string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// Groups 账号的**业务分组标签**（如 ["internal","external"]），落盘于文件**顶层**
+	// groups 键（嵌套形/扁平形同一位置，与 device_token 同风格）。
+	//
+	// 与 realm 的分工（两者正交，选号时 AND 组合）：
+	//   realm —— 账号**固有**的技术域，由 domain 决定、网关强制归一化为 cn/global，
+	//            **不可自定义**（见 realmLocked）；
+	//   Groups —— **运维自定义**的业务标签，可多个，用来把"哪把密钥能用它"这件事
+	//            从技术域里解耦出来。
+	//
+	// 语义：密钥带 groups 时，只有与之**有交集**的账号参与选号；密钥不带 groups
+	// （主密钥 / 未配置）时不过滤。账号 Groups 为空 = **未分组**，默认**不被任何
+	// 分组密钥选中**（默认拒绝：宁可漏用，不可串组）。
+	//
+	// 并发：仅 Parse/LoadDir 赋值一次，其后整个生命周期只读（热加载换的是新的
+	// *Auth 指针，而不是改这个字段），故不纳入 a.mu 保护 —— 与 realm 不同
+	// （realm 会被 RefreshToken 在锁内改写）。
+	Groups []string
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -106,6 +124,42 @@ func (a *Auth) RefreshTokenValue() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.RefreshToken
+}
+
+// ExpiresAtValue 加锁读取 access token 的到期时刻（Unix 秒）。RefreshToken 在锁内
+// 改写它，故跨包只读也必须经此取值（同 AccessTokenValue/DomainValue/RefreshTokenValue）。
+//
+// 用途：把「令牌到期」从**控制台读文件的旁路**（console/server.py 直接读 auths/*.json
+// 的 expiresAt）搬回网关权威侧 —— 文件值是「上次写回时的快照」，而池内进程持有的
+// ExpiresAt 才是选号/续期判定真正用的那个值。两者不一致（如文件陈旧但进程内已续期）
+// 时，运维看到的就是一个不存在的「已过期」。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
+// CredWrittenAt 返回凭证文件（FilePath）的最近写回时刻，ok=false 表示文件不可 stat
+// （不存在/无权限/FilePath 为空）。
+//
+// 为什么要它：区分两种「过期显示」——(1) 续期链路正常，文件刚被 SaveAtomic 写过，
+// 只是 access token 本身寿命短；(2) 文件长期未更新，说明续期根本没跑（账号被
+// disabled 后 RunKeepaliveNow 会 continue 跳过它，见 scheduler.go）——此时「过期」
+// 是病因的**症状**，不是原因。只看 expiresAt 一个数字区分不出这两者。
+//
+// 不返回 error：巡检/状态透出是**尽力而为**的观测，缺文件不该让它失败或报错。
+func (a *Auth) CredWrittenAt() (time.Time, bool) {
+	if a == nil || a.FilePath == "" {
+		return time.Time{}, false
+	}
+	fi, err := os.Stat(a.FilePath)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return fi.ModTime(), true
 }
 
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
@@ -183,6 +237,68 @@ func (a *Auth) RealmStored() string {
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 
+// GroupsValue 返回账号分组标签的**副本**（调用方可能缓存或跨 goroutine 传递，
+// 返回副本以免误改内部切片）。
+func (a *Auth) GroupsValue() []string {
+	if a == nil || len(a.Groups) == 0 {
+		return nil
+	}
+	out := make([]string, len(a.Groups))
+	copy(out, a.Groups)
+	return out
+}
+
+// MatchesGroups 报告本账号对「允许分组」是否可见：
+//
+//	want 为空    → 恒 true（不限分组：主密钥 / 未配置 groups 的密钥语义）
+//	账号未打标签 → 恒 false（**默认拒绝**：未分组的账号不给任何分组密钥用）
+//	否则         → 要求交集非空
+//
+// 比较是**精确相等**（不做大小写折叠、不做前缀匹配）：组名规范由密钥侧配置
+// （cmd/server/config.go 的正则 fail-fast）与控制台把关，读侧保持"读进来是什么
+// 就是什么"，避免两侧规则不一致导致的静默错配。
+func (a *Auth) MatchesGroups(want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	if a == nil || len(a.Groups) == 0 {
+		return false
+	}
+	for _, w := range want {
+		for _, g := range a.Groups {
+			if w == g {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// normalizeGroups 归一化账号分组标签：去首尾空白、丢弃空串、按首次出现顺序去重。
+//
+// 刻意**不做字符集校验**：组名规范由密钥侧配置与控制台把关，读侧保持宽松——否则
+// 手写文件里一个尾随空格就会让账号在热加载后静默消失，而热加载是 5 秒一次的常态
+// 路径（internal/pool/watch.go），这类静默失配的排查成本极高。
+func normalizeGroups(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, g := range in {
+		g = strings.TrimSpace(g)
+		if g == "" || seen[g] {
+			continue
+		}
+		seen[g] = true
+		out = append(out, g)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {
@@ -230,6 +346,8 @@ func Parse(raw []byte) (*Auth, error) {
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用）。
 			// 放在 auth 段之外，手写时无需嵌进 auth 对象，降低配置门槛。
 			DeviceToken string `json:"device_token"`
+			// Groups 顶层 groups（嵌套形与扁平形共用）：账号业务分组标签。
+			Groups []string `json:"groups"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -244,18 +362,20 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			Groups:       normalizeGroups(n.Groups),
 		}
 	} else {
 		var f struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresAt    int64  `json:"expiresAt"`
-			Domain       string `json:"domain"`
-			Realm        string `json:"realm"`
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
-			DeviceToken  string `json:"device_token"`
+			AccessToken  string   `json:"accessToken"`
+			RefreshToken string   `json:"refreshToken"`
+			ExpiresAt    int64    `json:"expiresAt"`
+			Domain       string   `json:"domain"`
+			Realm        string   `json:"realm"`
+			UID          string   `json:"uid"`
+			EnterpriseID string   `json:"enterpriseId"`
+			Nickname     string   `json:"nickname"`
+			DeviceToken  string   `json:"device_token"`
+			Groups       []string `json:"groups"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -270,6 +390,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			Groups:       normalizeGroups(f.Groups),
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -308,6 +429,15 @@ func (a *Auth) SaveAtomic() error {
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
+	}
+	// Groups 非空才写回顶层 groups（与 device_token 同策略：不给无该字段的旧文件引入空键）。
+	//
+	// ★ 必须写回 ★ 本函数用**固定字段集整体重写**文件，漏掉哪个键就等于把那个键从磁盘上
+	// 删掉。账号的 token 刷新（RefreshToken → SaveAtomic）是高频路径，漏写 groups 会让
+	// 分组标签"自己消失"——而且是静默的：标签没了 → 默认拒绝策略下账号被所有分组密钥
+	// 忽略 → 表现为"某分组突然无号可用"，但文件里看不到任何报错。
+	if len(a.Groups) > 0 {
+		doc["groups"] = a.Groups
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

@@ -15,6 +15,18 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 	return p.pick(tried, reqModel, realm)
 }
 
+// PickExcludingForRealmGroups 在 PickExcludingForRealm 之上再叠加**业务分组**过滤：
+// 候选须同时满足 Realm()==realm（realm 非空时）与 MatchesGroups(groups)（groups 非空时）。
+//
+// 两维正交（realm=技术域、groups=业务标签），AND 组合；任一为空则该维度不过滤。
+// realm 不匹配、分组不匹配的账号在**全冷却兜底路径**同样被排除（见
+// pickEarliestExpiryLockedScoped）。
+//
+// 这是生产链路的选号入口：由请求所带密钥的 groups 决定可见账号范围。
+func (p *Pool) PickExcludingForRealmGroups(tried map[string]bool, reqModel, realm string, groups []string) *auth.Auth {
+	return p.pickScoped(tried, reqModel, realm, groups)
+}
+
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
 // DeptestOnly: 仅 realm_test.go 引用；生产经 wiring.go 走
 // AvailableUIDsForModelRealm。保留作 ForModelRealm 的模型维度退化

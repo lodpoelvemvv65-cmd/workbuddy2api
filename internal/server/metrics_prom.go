@@ -11,8 +11,9 @@
 //   - **零新增上游请求**：全部读进程内状态，scrape 不触发任何网络调用。
 //   - **确定性输出**：模型按字典序、realm/state 按固定序，同一状态下两次抓取
 //     逐字节相等（项目对稳定输出的既有要求，见 List/rateLimitedModelsLocked）。
-//   - **不暴露高基数/敏感维度**：不加 per-uid 标签（泄漏 uid 且基数不可控）；
-//     逐账号台账由 /status 提供，此处不重复。输出不含凭证、token、会话键。
+//   - **不暴露高基数维度**：品牌/模型维度的标签取值来自客户端与上游，基数天然
+//     有界；账号维度用 uid **前 8 位**（见下方 per-account 段的破例说明）。
+//     输出不含凭证、token、会话键。
 package server
 
 import (
@@ -22,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 
+	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/taskledger"
 )
@@ -47,6 +49,19 @@ var promPoolStates = []string{
 type promRealmHealth struct {
 	label string
 	h     pool.RealmHealth
+}
+
+// promAccountCred 单个账号的凭证健康样本（P0-1，writePromMetrics 的输入）。
+//
+// label 用 uid **前 8 位**（logfmt.UID8 同一口径）：足以定位是哪个号、不足以反推
+// 完整 uid。为什么可以破例加账号级标签，见 writePromMetrics 内该段的注释。
+type promAccountCred struct {
+	label      string // uid 前 8 位
+	realm      string
+	expiresAt  int64 // access token 到期（Unix 秒，0 = 未知）
+	lastWrite  int64 // 凭证文件最后写回时刻（Unix 秒，0 = 文件不存在）
+	failStreak int   // 连续续期失败次数
+	needsRelog bool  // 只能重登恢复
 }
 
 // promWriter 极简 text exposition 写入器。
@@ -165,7 +180,7 @@ func promPoolStateValue(h pool.RealmHealth, state string) int {
 
 // writePromMetrics 生成完整 exposition 文本。纯函数（无 IO、无时间读取），
 // 便于测试用固定输入做逐行断言。
-func writePromMetrics(snap MetricsSnapshot, health []promRealmHealth, stickySessions int, costExploreEvents int64, wafActive bool, tasks map[string]taskledger.Run) string {
+func writePromMetrics(snap MetricsSnapshot, health []promRealmHealth, stickySessions int, costExploreEvents int64, wafActive bool, tasks map[string]taskledger.Run, creds []promAccountCred) string {
 	w := newPromWriter()
 
 	// ---------- 账号池（realm 维度） ----------
@@ -290,6 +305,56 @@ func writePromMetrics(snap MetricsSnapshot, health []promRealmHealth, stickySess
 		w.sample("wb2api_model_tokens_per_second", m.TokensPerSec, "model", m.Model)
 	}
 
+	// ---------- 账号凭证健康（P0-1，逐账号） ----------
+	//
+	// ★ 为什么这里破例加 per-account 标签 ★
+	// 本文件原先的纪律是"不加 per-uid 标签（泄漏 uid 且基数不可控）"。两个前提在
+	// wb2api 都不成立：账号池是**人工维护的有限小集合**（个位数，上限几十），基数
+	// 有界；标签取 uid **前 8 位**（与 logfmt.UID8 同口径），不是全量 uid。换来的
+	// 是真正缺的能力——**账号级告警**：`healthy=0` 只告诉你"出事了"，不告诉你
+	// "是哪个号、为什么"；而"某号凭证续期连续失败 5 次"恰恰只能逐账号观测。
+	// 逐账号明细仍以 /status 为单一事实来源，此处只导出告警必需的四个时间/计数，
+	// 不复制积分/成本/模型那些高基数维度。
+	if len(creds) > 0 {
+		// 稳定输出：按 account 标签字典序。List 已按 uid 排序，这里**再排一次**是
+		// 因为本函数是纯函数、可被测试用任意顺序喂入，输出稳定性不该依赖调用方。
+		sorted := make([]promAccountCred, len(creds))
+		copy(sorted, creds)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i].label < sorted[j].label })
+
+		// 到期时刻：仅在有值（>0）时输出。缺失 = "未知"，不输出比输出 0（=1970 年）
+		// 诚实——后者会让"这个账号凭证 55 年没更新过"这种假告警成立。
+		w.family("wb2api_account_token_expires_seconds", "该账号 access token 的到期时刻（Unix 秒）。缺失=无 expiry 信息。⚠️ 到期≠不可用：请求前会自动续期（NeedsRefresh），每日保活也会刷新。判「不可用」请看 wb2api_account_needs_relogin / 池状态。", "gauge")
+		for _, c := range sorted {
+			if c.expiresAt > 0 {
+				w.sample("wb2api_account_token_expires_seconds", float64(c.expiresAt), "account", c.label, "realm", c.realm)
+			}
+		}
+
+		// 为什么用**文件 mtime** 而不是进程内的 refresh_ok_at：后者重启即清零，
+		// 而 global 账号（exp 在 ~1 年后）几乎不会触发请求前续期，只有每日保活
+		// 会写文件 → 进程内时刻会在每次重启后空白数小时，监控上无法区分
+		// 「刚重启」与「保活坏了」。文件 mtime 重启后依然可读，能真实回答
+		// 「凭证多久没被写回过」。配合 token_expires_seconds 即可区分
+		// 「没续期」与「续期了但该 token 的绝对寿命本来就不变」。
+		w.family("wb2api_account_credential_last_refresh_seconds", "该账号凭证文件最后一次被写回的时刻（Unix 秒，取自文件 mtime）。缺失=凭证文件不存在。它变旧说明续期已长时间未落盘（保活可能没在跑）；⚠️ 它不前进≠续期失效——见 token_expires_seconds 的说明。", "gauge")
+		for _, c := range sorted {
+			if c.lastWrite > 0 {
+				w.sample("wb2api_account_credential_last_refresh_seconds", float64(c.lastWrite), "account", c.label, "realm", c.realm)
+			}
+		}
+
+		w.family("wb2api_account_refresh_fail_streak", "该账号连续续期失败次数（成功即清零）。>0 时优先查上游连通性与凭证有效性；被禁用（disabled）的账号不会被保活刷新，需用 /admin/accounts/{uid}/refresh 手动验证。", "gauge")
+		for _, c := range sorted {
+			w.sample("wb2api_account_refresh_fail_streak", float64(c.failStreak), "account", c.label, "realm", c.realm)
+		}
+
+		w.family("wb2api_account_needs_relogin", "该账号是否只能靠重新登录恢复（1=refresh token 已失效，软件无法自愈，revive 救不回）。这是唯一必须人工介入的账号状态，应作为最高优先级告警。", "gauge")
+		for _, c := range sorted {
+			w.sample("wb2api_account_needs_relogin", boolToFloat(c.needsRelog), "account", c.label, "realm", c.realm)
+		}
+	}
+
 	return w.sb.String()
 }
 
@@ -324,6 +389,28 @@ func (h *Handler) promMetrics(w http.ResponseWriter, r *http.Request) {
 		tasks = h.cfg.TaskLedger.Runs()
 	}
 
+	// 账号凭证健康样本（P0-1）：走 Pool.List 的只读快照，与 /status 同源，
+	// 不另立第二份状态（避免双写一致性问题）。uid 在此降为前 8 位。
+	var creds []promAccountCred
+	if h.cfg.Pool != nil {
+		all := h.cfg.Pool.List()
+		creds = make([]promAccountCred, 0, len(all))
+		for _, st := range all {
+			var lw int64
+			if st.CredWrittenAt != nil {
+				lw = st.CredWrittenAt.Unix()
+			}
+			creds = append(creds, promAccountCred{
+				label:      logfmt.UID8(st.UID),
+				realm:      st.Realm,
+				expiresAt:  st.TokenExpiresAt,
+				lastWrite:  lw,
+				failStreak: st.RefreshFailStreak,
+				needsRelog: st.NeedsRelogin,
+			})
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = w.Write([]byte(writePromMetrics(snap, health, sticky, exploreEvents, h.wafIP.active(), tasks)))
+	_, _ = w.Write([]byte(writePromMetrics(snap, health, sticky, exploreEvents, h.wafIP.active(), tasks, creds)))
 }

@@ -34,6 +34,10 @@ const degradeReason = "consecutive failures"
 type Status struct {
 	UID           string    `json:"uid"`
 	Realm         string    `json:"realm,omitempty"`
+	// Groups 账号的**业务分组标签**（分组密钥功能）。运维据此在 /status 一眼确认
+	// "这个号落在哪几把密钥的可见范围内"，不必去翻 auth 文件。
+	// 未打标签时 omitempty 不输出（与 realm 同处理：空值不占版面，也不让人误读）。
+	Groups        []string  `json:"groups,omitempty"`
 	Nickname      string    `json:"nickname,omitempty"`
 	Credits       int64     `json:"credits"`
 	Cooling       bool      `json:"cooling"`
@@ -78,6 +82,44 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+
+	// —— 凭证健康（P0-1）——
+	//
+	// 动机：控制台原本只把「令牌到期」一个数字摆给运维看，而这个数字**既不能回答
+	// 「还能不能用」**（access token 到期会被请求前 NeedsRefresh 续期 + 每日 keepalive
+	// 无条件刷新），**也不能回答「坏事会不会自己好」**（refresh token 失效后软件无法
+	// 自愈）。一个误导数字 → 每组四个可决策判据，且判据全部来自网关进程内权威状态，
+	// 不再依赖控制台去读 auths/*.json 的快照。
+	//
+	// TokenExpiresAt access token 到期时刻（Unix 秒；0 = 无 expiry 信息）。
+	TokenExpiresAt int64 `json:"token_expires_at,omitempty"`
+	// TokenExpired access token 此刻是否已过期。
+	// ⚠️ 过期 **≠** 不可用：请求前会先续期；真不可用看 needs_relogin / disabled。
+	// 显式恒写出（不 omitempty）：false 是有意义的信息（"这个号没过期"）。
+	TokenExpired bool `json:"token_expired"`
+	// CredWrittenAt 凭证文件最近写回时刻。**指针**语义同 stateAccount.BreakerUntil：
+	// nil = 未知（文件不存在/不可 stat），只有指针才能被 omitempty 真正省略——
+	// 非指针 time.Time 的零值会序列化成 0001-01-01T00:00:00Z，让监控把"未知"
+	// 误读成"该账号凭证写于公元 1 年"。
+	CredWrittenAt *time.Time `json:"cred_written_at,omitempty"`
+	// RefreshOKAt 最近一次续期成功时刻（进程内台账；重启清零）。nil = 本进程尚未
+	// 观测到成功续期（**不代表失败**）。指针语义同上。
+	RefreshOKAt *time.Time `json:"refresh_ok_at,omitempty"`
+	// RefreshFailStreak 连续续期失败次数（进程内台账；成功即清零，重启清零）。
+	// 恒写出（运维口径，同 consecutive_fails）：0 是"续期一直正常"的证据。
+	RefreshFailStreak int `json:"refresh_fail_streak"`
+	// SessionDeadFails 连续 12153（session dead）计数（**持久化**，驱动禁用）。
+	// 恒写出：这才是"离被杀号还有几步"的真进度条。
+	SessionDeadFails int `json:"session_dead_fails"`
+	// NeedsRelogin refresh token 已失效，**软件无法自愈**，必须人工重新登录
+	// （走 OAuth 设备码流程重换 refresh token）。判据：
+	// disabled && (session_dead_fails > 0 || reason 含 12153)。
+	// 这是与 disabled 分开的字段：disabled 里混着"网络抖动误判"这类可 revive 的，
+	// 本字段专指"revive 也救不回、只能重登"的那一类——控制台据此把按钮从
+	// 「复活」切成「重新登录」，避免运维点了复活却发现它立刻又死。
+	NeedsRelogin bool `json:"needs_relogin"`
+	// LastRefreshErr 最近一次续期失败的错误摘要（截断至 80 字符）。
+	LastRefreshErr string `json:"last_refresh_err,omitempty"`
 }
 
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
@@ -168,6 +210,22 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// —— 续期健康台账（P0-1，**运行态，不持久化**）——
+	//
+	// 为什么运行态就够：这三个字段回答的是「此刻续期链路还活着吗」，本来就是瞬时
+	// 事实。落盘只会让运维在重启后看到一个陈旧结论（"上次续期是 3 天前"），反而
+	// 比「未知」更误导。重启清零 = 从零重新观测，诚实。
+	//
+	// 为什么必须与 sessionDeadFails 分开：后者是**持久化的、驱动禁用的**判定计数器
+	// （连续 12153 达阈值才 Disable），而这里的 refreshFailStreak 是**非持久化的、
+	// 只用于观测的**连击计数——刷新失败有很多原因（网络抖动/上游 5xx/token 真失效），
+	// 只有 12153 才升级为杀号。混用一个计数器会让网络抖动开始"攒杀号进度"。
+	//
+	// 写入点全部在 p.mu 写锁内（NoteRefreshOK/NoteRefreshFail），读取点 statusOf
+	// 在 p.mu 读锁内、RefreshLedger 在读锁内不存在竞争。
+	refreshOKAt       time.Time // 最近一次续期成功时刻
+	refreshFailStreak int       // 连续续期失败次数（成功即清零）
+	lastRefreshErr    string    // 最近一次续期失败的错误摘要（已截断，供人读）
 	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
 	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
 	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态

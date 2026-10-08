@@ -169,7 +169,7 @@ func TestPromMetricsTaskFamilies(t *testing.T) {
 		"checkin": ledgerRun("checkin", taskledger.TriggerSchedule, 12, 0, fin),
 		"travel":  ledgerRun("travel", taskledger.TriggerSchedule, 0, 3, fin),
 	}
-	out := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, tasks)
+	out := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, tasks, nil)
 
 	for _, want := range []string{
 		"# HELP wb2api_task_last_run_timestamp_seconds",
@@ -208,9 +208,9 @@ func TestPromMetricsTaskOutputDeterministic(t *testing.T) {
 		"checkin":   ledgerRun("checkin", taskledger.TriggerSchedule, 12, 0, fin),
 		"keepalive": ledgerRun("keepalive", taskledger.TriggerSchedule, 5, 1, fin),
 	}
-	first := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, tasks)
+	first := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, tasks, nil)
 	for i := 0; i < 20; i++ {
-		if got := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, tasks); got != first {
+		if got := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, tasks, nil); got != first {
 			t.Fatalf("第 %d 次渲染与首次不同：输出顺序不稳定", i+2)
 		}
 	}
@@ -226,7 +226,7 @@ func TestPromMetricsTaskOutputDeterministic(t *testing.T) {
 // TestPromMetricsTaskSectionAbsentWhenUnwired 未接线时整个任务家族不出现——
 // 开了 metrics 但没接台账（例如只跑 cmd/activity）不该输出一堆 0。
 func TestPromMetricsTaskSectionAbsentWhenUnwired(t *testing.T) {
-	out := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, nil)
+	out := writePromMetrics(MetricsSnapshot{}, nil, 0, 0, false, nil, nil)
 	if strings.Contains(out, "wb2api_task_") {
 		t.Errorf("未接线时不该输出任务指标\n---\n%s", out)
 	}
